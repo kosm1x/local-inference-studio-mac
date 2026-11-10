@@ -1,0 +1,23 @@
+# Model payloads are never committed (models/manifest.json and models/README.md are).
+models/**/*.gguf
+models/**/*.safetensors
+models/**/*.bin
+models/**/*.zip
+models/**/*.part
+models/**/*.incomplete
+models/**/.cache/
+*.gguf
+*.zip
+
+# Runtime state: per-start API key, server logs, pid file, lock, verify marker.
+logs/
+
+# Binaries (llama.cpp comes from Homebrew; nothing is vendored).
+bin/
+
+# Bench results (JSON + tee'd console logs) stay local.
+bench/results/
+
+.DS_Store
+__pycache__/
+*.pyc

@@ -1,0 +1,4 @@
+{
+  "about": "GGUF files this checkout may serve. Same schema as the Windows reference (path, repo, revision, file, size, sha256, optional default) plus id (which config/lis.conf MODEL_ID selects) and the optional per-model fields kv_type, sampling and server_args (models/README.md). path is repo-relative under models/. size is the byte count (stat -f %z) and sha256 the lowercase hex digest (shasum -a 256) of the downloaded file; scripts/serve.sh refuses a start when either differs (checked at most once per boot). No model has been chosen yet, so the list is empty. See models/README.md.",
+  "files": []
+}
