@@ -28,3 +28,8 @@
 - **Avoid:** a "stale" judgement and the identity it is checked against being read at different moments; capture the identity before the liveness check.
 - **Better:** the re-audit was given the builders' claims as numbered items to disprove against the real binaries; it confirmed 58 flag arities and still found the one defect the builders' own tests could not see.
 - **Avoid:** timing assertions at 200 KB when production caps input at 32 KB; they flake under load and prove nothing about the real path.
+
+## 2026-11-10 — machine cleanup before the model download, session wrap
+- **Mistake:** a mutation-test command started by an audit agent kept running after the agent reported; it sat blocked for over two hours in a scratch copy and the operator saw it as a live agent. -> Every brief that starts background or mutation runs ends with "list what you left running and stop it"; the orchestrator checks `ps` before reporting idle.
+- **Avoid:** judging a model fit before the machine is ready: at survey time swap held 10.8 GB, 232 MB of RAM was unused and Low Power Mode was on. A first bench in that state would have measured the laptop, not the model.
+- **Better:** pre-flight before any serve or bench: uptime, swap, free memory, Low Power Mode off, browser closed; record the numbers next to the bench log.
