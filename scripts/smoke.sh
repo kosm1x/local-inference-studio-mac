@@ -16,7 +16,7 @@
 # Usage: scripts/smoke.sh [--port N] [--max-tokens N] [--model NAME]
 # The key is the first line of logs/api-key (written by scripts/serve.sh on each start);
 # it goes to curl through a mode-600 config file, never on a command line.
-# UNVERIFIED: never run against a live server on this machine (no model chosen yet).
+# Ran against a live server on 2026-11-14 (llama-server 1.0.0 build 12359; both manifest models; smoke PASS; bench logs under bench/results/).
 set -u
 umask 077
 

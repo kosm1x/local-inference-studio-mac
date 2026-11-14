@@ -27,7 +27,7 @@
 #
 # Usage: bench/run.sh --label NAME [--quant Q] [--ctx N] [--ngl V] [--runs N]
 #                     [--tool-trials N] [--prefill-tokens N] [--port N] [--out-dir DIR]
-# UNVERIFIED: never run against a live server on this machine (no model chosen yet).
+# Ran against a live server on 2026-11-14 (llama-server 1.0.0 build 12359; both manifest models; smoke PASS; bench logs under bench/results/).
 set -u
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P) || exit 1

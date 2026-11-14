@@ -33,3 +33,9 @@
 - **Mistake:** a mutation-test command started by an audit agent kept running after the agent reported; it sat blocked for over two hours in a scratch copy and the operator saw it as a live agent. -> Every brief that starts background or mutation runs ends with "list what you left running and stop it"; the orchestrator checks `ps` before reporting idle.
 - **Avoid:** judging a model fit before the machine is ready: at survey time swap held 10.8 GB, 232 MB of RAM was unused and Low Power Mode was on. A first bench in that state would have measured the laptop, not the model.
 - **Better:** pre-flight before any serve or bench: uptime, swap, free memory, Low Power Mode off, browser closed; record the numbers next to the bench log.
+
+## 2026-11-14 — first live run and benches (llama-server 1.0.0, both models)
+- **Avoid:** `--reasoning off` as a default for every model. It is right for the Qwen3.8-27B file (20/20 tools) and wrong for the Qwen3.6-35B-A3B file (14/20, the misses are invented answers with stop_reason end_turn; 20/20 with `--reasoning auto`).
+- **Better:** when the bench reports `no_call`, replay those prompts and read the reply text before blaming the template; a fabricated answer points at the model's thinking setting, a tool call printed as text points at the template.
+- **Better:** settings that differ by model (KV type, sampling, reasoning, chat template) belong in the manifest entry, so `MODEL_ID` is the only line to change.
+- **Mistake:** the 2026-11-10 tier quoted 14-20 tok/s decode for the MoE file; measured 37.88. The prefill estimate held (264.6 tok/s). Estimates in docs stay marked as estimates until a tee'd bench log exists.

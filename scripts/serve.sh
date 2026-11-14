@@ -25,17 +25,21 @@ set +xv  # first: an inherited SHELLOPTS=xtrace/verbose would print the API key 
 #               config/lis.conf and models/manifest.json; starts nothing, writes nothing,
 #               takes no lock and does not need the model file to exist.
 #   --wait N    --detach health timeout in seconds (default 300).
-#   --reasoning passed as --reasoning (default off, as in serve.ps1: the 2026-10-26
-#               compaction bench on the reference machine got a real summary on every
-#               compaction request only with server thinking off).
+#   --reasoning passed as --reasoning. Precedence: this flag when given, else the
+#               manifest entry's "reasoning", else off (off as in serve.ps1: the
+#               2026-10-26 compaction bench on the reference machine got a real summary
+#               on every compaction request only with server thinking off).
 #   -- ...      extra llama-server arguments, one per argv element, appended after the
 #               fixed ones. Each must pass the ALLOW-LIST below (check_args).
 #
 # Settings come from config/lis.conf (PORT, CTX, KV_TYPE, MODEL_ID, CHAT_TEMPLATE),
 # which is parsed line by line and never sourced. The model is the models/manifest.json
 # entry whose "id" equals MODEL_ID; its path is repo-relative. The entry may carry
-# per-model settings (server_args, sampling, kv_type; see PY_MANIFEST and
-# models/README.md); server_args pass the same allow-list as the -- arguments.
+# per-model settings (server_args, sampling, kv_type, reasoning, chat_template; see
+# PY_MANIFEST and models/README.md); server_args pass the same allow-list as the --
+# arguments. The entry's chat_template, when present, is used instead of CHAT_TEMPLATE
+# and passes the same path checks (check_template); without it CHAT_TEMPLATE applies
+# (empty = the template embedded in the GGUF).
 #
 # Safety properties (the first five kept from serve.ps1):
 #   - bind 127.0.0.1 only (--host is fixed; no extra argument can set it);
@@ -95,6 +99,7 @@ say() { printf 'serve.sh: %s\n' "$*" >&2; }
 die() { say "$*"; exit 1; }
 usage() {
     say "usage: scripts/serve.sh [--detach | --dry-run] [--wait SECONDS] [--reasoning off|on|auto] [-- EXTRA_ARGS...]"
+    say "  --reasoning: this flag when given, else the manifest entry's \"reasoning\", else off"
     exit 2
 }
 
@@ -143,7 +148,8 @@ CLEARED_MSG=""
 # ---------------------------------------------------------------- arguments
 MODE=foreground
 WAIT_SEC=300
-REASONING=off
+REASONING_CLI=""
+REASONING_GIVEN=0  # 1 when --reasoning was given (then it wins over the manifest entry)
 EXTRA=()
 while [ $# -gt 0 ]; do
     case $1 in
@@ -156,7 +162,8 @@ while [ $# -gt 0 ]; do
             ;;
         --reasoning)
             [ $# -ge 2 ] || usage
-            REASONING=$2
+            REASONING_CLI=$2
+            REASONING_GIVEN=1
             shift
             ;;
         --) shift; EXTRA=("$@"); break ;;
@@ -167,13 +174,16 @@ while [ $# -gt 0 ]; do
 done
 re_wait='^[1-9][0-9]{0,4}$'
 [[ $WAIT_SEC =~ $re_wait ]] || die "--wait must be a whole number of seconds (1-99999), got '$WAIT_SEC'"
-case $REASONING in off|on|auto) ;; *) die "--reasoning must be off, on or auto, got '$REASONING'" ;; esac
+if [ "$REASONING_GIVEN" = 1 ]; then
+    case $REASONING_CLI in off|on|auto) ;; *) die "--reasoning must be off, on or auto, got '$REASONING_CLI'" ;; esac
+fi
 
 # ---------------------------------------------------------------- extra arguments
 # ALLOW-LIST. Extra arguments (the -- ones and a manifest entry's server_args) may only
-# be these flags of this build (llama-server 0.9.0, build 12110, commit cd959bae9; each
-# spelling and alias read from its --help on 2026-11-10 and parsed by the binary with
-# --version), each with the value kind it takes:
+# be these flags of this build (llama-server 1.0.0, build 12359, commit b1b770d90; each
+# spelling and alias read from the 0.9.0 --help on 2026-11-10, then on 2026-11-14 found
+# again in the 1.0.0 --help with the same value kinds and parsed by the 1.0.0 binary
+# with --version), each with the value kind it takes:
 #   none       no value;
 #   count      a decimal integer 0-9999999 (no sign, no leading zero);
 #   layers     a count, auto or all;
@@ -242,12 +252,13 @@ kind_text() {
 # Ported verbatim from serve.ps1 ($fixedFlag, reference commit cafc34b, lines 183-185;
 # security audit B6/B7): the loopback bind, the port, the key, the disabled web UI, tools
 # and MCP and the server's file paths are fixed here. Every flag on it exists in this
-# llama-server build's --help (checked 2026-11-10, version 0.9.0, build 12110, commit
-# cd959bae9).
+# llama-server build's --help (checked 2026-11-14, version 1.0.0, build 12359, commit
+# b1b770d90; first checked 2026-11-10 on 0.9.0).
 FIXED_FLAG_RE='^(--(host|port|api-key|api-key-file|connect|connect-code|tools|agent|reuse-port|webui|ui|mcp-servers-config|mcp-servers-json|ui-mcp-proxy|webui-mcp-proxy|path|media-path|hf-token|slot-save-path|log-prompts-dir|props|models-dir|models-preset)|-ag|-hft)(=|$)'
-# macOS build additions (NOT in serve.ps1): flags of this build (0.9.0, build 12110,
-# commit cd959bae9) that the Windows list does not name and that widen exposure, read
-# from its --help on 2026-11-10. Same matching rules as the block above.
+# macOS build additions (NOT in serve.ps1): flags of this build (1.0.0, build 12359,
+# commit b1b770d90) that the Windows list does not name and that widen exposure, read
+# from the 0.9.0 --help on 2026-11-10; every one is still in the 1.0.0 --help (checked
+# 2026-11-14). Same matching rules as the block above.
 #   - files the server reads and serves, or writes: --ui-config-file/--webui-config-file
 #     (JSON served to clients), --log-file, -lcd/--lookup-cache-dynamic (updated by
 #     generation);
@@ -347,12 +358,14 @@ re_port='^[1-9][0-9]{0,4}$'
 [[ $CFG_PORT =~ $re_port ]] && [ "$CFG_PORT" -le 65535 ] || die "PORT in $CONF must be 1-65535, got '$CFG_PORT'"
 re_ctx='^[1-9][0-9]{0,7}$'
 [[ $CFG_CTX =~ $re_ctx ]] || die "CTX in $CONF must be a positive integer, got '$CFG_CTX'"
-# Allowed values from this build's --help for -ctk/-ctv ("allowed values: f32, f16, bf16,
-# q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1", "(default: f16)"). f16 is the unquantized
+# Allowed values from this build's --help for -ctk and for -ctv (1.0.0, 2026-11-14:
+# "allowed values: f32, f16, bf16, f8_e4m3, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1",
+# "(default: f16)"; f8_e4m3 is new in 1.0.0 and `-ctk f8_e4m3 -ctv f8_e4m3 --version`
+# parses; a model load and serve with it on Metal is UNVERIFIED). f16 is the unquantized
 # default, so KV_TYPE=f16 means "do not quantize the KV cache"; it is still passed
 # explicitly as -ctk f16 -ctv f16 (the help lists it as a value, and an explicit flag
 # does not depend on the default staying f16).
-KV_ALLOWED="f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1"
+KV_ALLOWED="f32 f16 bf16 f8_e4m3 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1"
 re_kv='^[a-z0-9_]+$'
 case " $KV_ALLOWED " in
     *" $CFG_KV "*) [[ $CFG_KV =~ $re_kv ]] || die "KV_TYPE in $CONF must be one of $KV_ALLOWED, got '$CFG_KV'" ;;
@@ -389,17 +402,26 @@ contained() {
         *) die "$1 $2 resolves to $phys, outside $3; refusing" ;;
     esac
 }
-TEMPLATE=""
-if [ -n "$CFG_TEMPLATE" ]; then
-    re_rel='^[A-Za-z0-9._/-]+$'
-    [[ $CFG_TEMPLATE =~ $re_rel ]] || die "CHAT_TEMPLATE in $CONF has characters outside [A-Za-z0-9._/-]: '$CFG_TEMPLATE'"
-    case "/$CFG_TEMPLATE/" in
-        //*|*/../*|*/./*|*//*) die "CHAT_TEMPLATE in $CONF must be a plain repo-relative path, got '$CFG_TEMPLATE'" ;;
+# check_template LABEL REL: the one check for a chat template path, used for CHAT_TEMPLATE
+# in config/lis.conf and for a manifest entry's chat_template. Dies (naming LABEL) unless
+# REL is a plain repo-relative path of [A-Za-z0-9._/-] (no leading "/", no "..", "." or
+# empty component), not a symlink, physically inside config/, and an existing regular
+# file; on success TEMPLATE is its absolute path.
+re_rel='^[A-Za-z0-9._/-]+$'
+check_template() {
+    local label=$1 rel=$2
+    [[ $rel =~ $re_rel ]] || die "$label has characters outside [A-Za-z0-9._/-]: '$rel'"
+    case "/$rel/" in
+        //*|*/../*|*/./*|*//*) die "$label must be a plain repo-relative path, got '$rel'" ;;
     esac
-    TEMPLATE="$ROOT/$CFG_TEMPLATE"
-    contained "chat template (CHAT_TEMPLATE in $CONF)" "$TEMPLATE" "$ROOT/config"
-    [ -f "$TEMPLATE" ] || die "chat template not found: $TEMPLATE"
-fi
+    TEMPLATE="$ROOT/$rel"
+    contained "chat template ($label)" "$TEMPLATE" "$ROOT/config"
+    [ -f "$TEMPLATE" ] || die "chat template not found: $TEMPLATE ($label)"
+}
+# CHAT_TEMPLATE is checked whenever it is set, also when the manifest entry's
+# chat_template replaces it below (a broken config line refuses rather than hides).
+TEMPLATE=""
+[ -n "$CFG_TEMPLATE" ] && check_template "CHAT_TEMPLATE in $CONF" "$CFG_TEMPLATE"
 
 # ---------------------------------------------------------------- tools
 # Never from PATH. A tool is taken from the first of /opt/homebrew/bin and /usr/local/bin
@@ -557,8 +579,9 @@ fi
 
 # ---------------------------------------------------------------- manifest
 # For the single entry whose id is argv[2], prints one value per line: path, size,
-# sha256, kv_type, temp, top_p, top_k (empty line = absent), then one line per
-# server_args element. argv[3] is the space-separated list of allowed KV types.
+# sha256, kv_type, temp, top_p, top_k, reasoning, chat_template (empty line = absent),
+# then one line per server_args element. argv[3] is the space-separated list of allowed
+# KV types.
 # Entry fields (strict: an unknown field, a wrong type or a value out of range refuses):
 #   id, path, size, sha256 (required); repo, revision, file (strings), default (bool);
 #   server_args: list of non-empty strings without control characters, appended to the
@@ -566,7 +589,12 @@ fi
 #     -- arguments);
 #   sampling: object with any of temp (number >= 0), top_p (number 0..1), top_k
 #     (integer >= 0); finite numbers only, booleans rejected;
-#   kv_type: one of the allowed KV types; overrides KV_TYPE from config/lis.conf.
+#   kv_type: one of the allowed KV types; overrides KV_TYPE from config/lis.conf;
+#   reasoning: one of the strings off, on, auto; the --reasoning value when serve.sh's
+#     own --reasoning flag is not given (that flag wins; neither = off);
+#   chat_template: a non-empty string without control characters; bash then runs it
+#     through check_template (the same checks as CHAT_TEMPLATE: repo-relative, inside
+#     config/, an existing file) and uses it instead of CHAT_TEMPLATE.
 PY_MANIFEST='
 import json, math, re, sys
 path, want, kv_allowed = sys.argv[1], sys.argv[2], sys.argv[3].split()
@@ -596,7 +624,8 @@ if type(size) is not int or size <= 0:
     fail("entry %r: size must be a positive integer, got %r" % (want, size))
 if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
     fail("entry %r: sha256 must be 64 lowercase hex characters, got %r" % (want, sha))
-known = {"id", "path", "size", "sha256", "repo", "revision", "file", "default", "server_args", "sampling", "kv_type"}
+known = {"id", "path", "size", "sha256", "repo", "revision", "file", "default", "server_args", "sampling", "kv_type",
+         "reasoning", "chat_template"}
 unknown = sorted(set(e) - known)
 if unknown:
     fail("entry %r: unknown field(s) %s (allowed: %s)" % (want, ", ".join(unknown), ", ".join(sorted(known))))
@@ -614,6 +643,13 @@ for a in args:
 kv = e.get("kv_type", "")
 if "kv_type" in e and (not isinstance(kv, str) or kv not in kv_allowed):
     fail("entry %r: kv_type must be one of %s, got %r" % (want, " ".join(kv_allowed), kv))
+rea = e.get("reasoning", "")
+if "reasoning" in e and (not isinstance(rea, str) or rea not in ("off", "on", "auto")):
+    fail("entry %r: reasoning must be one of the strings off, on, auto, got %r" % (want, rea))
+tpl = e.get("chat_template", "")
+if "chat_template" in e and (not isinstance(tpl, str) or not tpl or any(ord(c) < 32 or ord(c) == 127 for c in tpl)):
+    fail("entry %r: chat_template must be a non-empty repo-relative path string without control characters, got %r"
+         % (want, tpl))
 samp = e.get("sampling", {})
 if not isinstance(samp, dict):
     fail("entry %r: sampling must be an object, got %r" % (want, samp))
@@ -640,7 +676,7 @@ if "top_k" in samp:
     if not isinstance(v, int) or v < 0:
         fail("entry %r: sampling.top_k must be an integer >= 0, got %r" % (want, v))
     out["top_k"] = str(v)
-for line in [p, str(size), sha, kv, out.get("temp", ""), out.get("top_p", ""), out.get("top_k", "")] + args:
+for line in [p, str(size), sha, kv, out.get("temp", ""), out.get("top_p", ""), out.get("top_k", ""), rea, tpl] + args:
     print(line)
 '
 entry=$("$PY" -I -c "$PY_MANIFEST" "$MANIFEST" "$CFG_MODEL_ID" "$KV_ALLOWED") || die "model lookup failed (MODEL_ID=$CFG_MODEL_ID)"
@@ -653,6 +689,8 @@ SERVER_ARGS=()
     IFS= read -r M_TEMP
     IFS= read -r M_TOP_P
     IFS= read -r M_TOP_K
+    IFS= read -r M_REASONING
+    IFS= read -r M_TEMPLATE
     while IFS= read -r a; do SERVER_ARGS+=("$a"); done
 } <<< "$entry"
 MODEL="$ROOT/$MODEL_REL"
@@ -665,16 +703,28 @@ TEMP=0.6; TOP_P=0.95; TOP_K=20
 [ -n "$M_TEMP" ] && TEMP=$M_TEMP
 [ -n "$M_TOP_P" ] && TOP_P=$M_TOP_P
 [ -n "$M_TOP_K" ] && TOP_K=$M_TOP_K
+# --reasoning: the command-line flag when given, else the entry's reasoning, else off.
+REASONING=off
+[ -n "$M_REASONING" ] && REASONING=$M_REASONING
+[ "$REASONING_GIVEN" = 1 ] && REASONING=$REASONING_CLI
+case $REASONING in off|on|auto) ;; *) die "internal: reasoning value '$REASONING'" ;; esac
+# Chat template: the entry's chat_template (same checks as CHAT_TEMPLATE) replaces
+# CHAT_TEMPLATE; without it, TEMPLATE keeps what CHAT_TEMPLATE set above (or none).
+[ -n "$M_TEMPLATE" ] && check_template "chat_template of manifest entry $CFG_MODEL_ID" "$M_TEMPLATE"
 
 # ---------------------------------------------------------------- command line
 # Flags as in serve.ps1 (-fa on, -np 1, Qwen sampling, --reasoning-format auto,
 # --reasoning, --api-key-file, --no-webui, --metrics, --no-mmproj, loopback --host).
-# Each one is in this build's --help (version 0.9.0, build 12110, commit cd959bae9).
-# Not ported: -hf (models come from the manifest only), --n-cpu-moe (no discrete GPU:
-# unified memory), MTP (--spec-type draft-mtp, tied to one Windows model file), -lv 3
-# (the -Web mode). The default sampling (0.6 / 0.95 / 20) is Qwen's; a manifest entry's
-# "sampling" replaces any of the three, its "kv_type" replaces KV_TYPE, and its
-# "server_args" come after the fixed flags and before the -- extra arguments.
+# Each one is in this build's --help (version 1.0.0, build 12359, commit b1b770d90;
+# checked 2026-11-14; 1.0.0 lists "--reasoning [on|off|auto]" with an optional value and
+# default auto, so serve.sh always passes the value). Not ported: -hf (models come from
+# the manifest only), --n-cpu-moe (no discrete GPU: unified memory), MTP (--spec-type
+# draft-mtp, tied to one Windows model file), -lv 3 (the -Web mode). The default
+# sampling (0.6 / 0.95 / 20) is Qwen's; a manifest entry's "sampling" replaces any of
+# the three, its "kv_type" replaces KV_TYPE, its "reasoning" sets --reasoning unless
+# serve.sh's --reasoning flag is given, its "chat_template" replaces CHAT_TEMPLATE
+# (--chat-template-file), and its "server_args" come after the fixed flags and before
+# the -- extra arguments.
 # --offline (NOT in serve.ps1): this build's --help says "Offline mode: forces use of
 # cache, prevents network access"; it takes no value and has no --no-offline. Measured
 # 2026-11-10: `llama-server --offline --version` parses, and `--offline -m <local file>`

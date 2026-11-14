@@ -1,4 +1,32 @@
 {
-  "about": "GGUF files this checkout may serve. Same schema as the Windows reference (path, repo, revision, file, size, sha256, optional default) plus id (which config/lis.conf MODEL_ID selects) and the optional per-model fields kv_type, sampling and server_args (models/README.md). path is repo-relative under models/. size is the byte count (stat -f %z) and sha256 the lowercase hex digest (shasum -a 256) of the downloaded file; scripts/serve.sh refuses a start when either differs (checked at most once per boot). No model has been chosen yet, so the list is empty. See models/README.md.",
-  "files": []
+  "about": "GGUF files this checkout may serve. Same schema as the Windows reference (path, repo, revision, file, size, sha256, optional default) plus id (which config/lis.conf MODEL_ID selects) and the optional per-model fields kv_type, sampling, server_args, reasoning and chat_template (models/README.md). path is repo-relative under models/. size is the byte count (stat -f %z) and sha256 the lowercase hex digest (shasum -a 256) of the downloaded file; scripts/serve.sh refuses a start when either differs (checked at most once per boot). See models/README.md.",
+  "files": [
+    {
+      "id": "qwen3.6-35b-a3b-heretic-iq3m",
+      "path": "models/qwen3.6-35b-a3b-heretic/Qwen3.6-35B-A3B-uncensored-heretic.i1-IQ3_M.gguf",
+      "repo": "mradermacher/Qwen3.6-35B-A3B-uncensored-heretic-i1-GGUF",
+      "revision": "97c91a931dbfd582487e8866bd129a2e8765051d",
+      "file": "Qwen3.6-35B-A3B-uncensored-heretic.i1-IQ3_M.gguf",
+      "size": 15440520352,
+      "sha256": "18f3d1853052d31fd1012291768daa6dcd81479e10b92436e2f2b04426ea36e0",
+      "default": true,
+      "kv_type": "f16",
+      "reasoning": "auto",
+      "server_args": [
+        "--swa-full"
+      ]
+    },
+    {
+      "id": "qwen3.8-27b-orcarouter-iq3xxs",
+      "path": "models/qwen3.8-27b-orcarouter-gsq-rco/Qwen3.8-27B-OrcaRouter-GSQ-RCO-IQ3_XXS-v2.1.gguf",
+      "repo": "RentedNoodle/Qwen3.8-27B-OrcaRouter-GSQ-RCO-IQ3_XXS-Uncensored",
+      "revision": "2113bb22c43635fcdaad4b728c914db4c2ec1d3b",
+      "file": "Qwen3.8-27B-OrcaRouter-GSQ-RCO-IQ3_XXS-v2.1.gguf",
+      "size": 10382717184,
+      "sha256": "ab955b5083d9cdf0bf55c37acdcae359b78756c4544d97960c23d8fca98feb9b",
+      "kv_type": "q4_0",
+      "reasoning": "off",
+      "chat_template": "config/chat-templates/qwen3.8-27b.jinja"
+    }
+  ]
 }

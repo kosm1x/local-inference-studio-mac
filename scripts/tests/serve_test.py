@@ -40,8 +40,9 @@ REFUSED = [
     "--slot-save-path", "--log-prompts-dir", "--props", "--models-dir", "--models-preset",
     "-ag", "-hft",
 ]
-# The macOS build additions (MAC_FLAG_RE): flags of llama-server 0.9.0 (build 12110) that
-# the Windows list does not name and that widen exposure.
+# The macOS build additions (MAC_FLAG_RE): flags of llama-server (read from 0.9.0's --help;
+# all still in 1.0.0, build 12359, checked 2026-11-14) that the Windows list does not name
+# and that widen exposure.
 MAC_REFUSED = [
     "--ui-config-file", "--webui-config-file", "--log-file", "--lookup-cache-dynamic", "--tools-runtime",
     "--video-ffmpeg-dir", "--rpc", "--model", "--model-url", "--docker-repo", "--hf-repo", "--hf-file",
@@ -592,6 +593,138 @@ class ServeTest(unittest.TestCase):
                 self.assertEqual(r.returncode, 1, r.stdout)
                 self.assertIn("KV_TYPE", r.stderr)
 
+    def test_kv_type_f8_e4m3(self):
+        """1.0.0 lists f8_e4m3 for both -ctk and -ctv; it is accepted from either source."""
+        self.t.conf.update(KV_TYPE="f8_e4m3")
+        self.t.write_conf()
+        argv = shlex.split(self.dry().stdout)
+        self.assertEqual((opt(argv, "-ctk"), opt(argv, "-ctv")), ("f8_e4m3", "f8_e4m3"))
+        self.t.conf.update(KV_TYPE="q4_0")
+        self.t.write_conf()
+        self.entry_with(kv_type="f8_e4m3")
+        argv = shlex.split(self.dry().stdout)
+        self.assertEqual((opt(argv, "-ctk"), opt(argv, "-ctv")), ("f8_e4m3", "f8_e4m3"))
+
+    @unittest.skipUnless(INSTALLED, "no installed llama-server")
+    def test_kv_types_parse_in_installed_binary(self):
+        """Every KV type serve.sh allows is a value the real parser takes for -ctk and -ctv."""
+        kv = re.search(r'^KV_ALLOWED="([^"]*)"$', SERVE.read_text(), re.M).group(1).split()
+        self.assertIn("f8_e4m3", kv)
+        for t in kv:
+            with self.subTest(kv=t):
+                r = subprocess.run([INSTALLED, "-ctk", t, "-ctv", t, "--version"], capture_output=True, text=True,
+                                   timeout=30)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertNotIn("Unsupported cache type", r.stdout + r.stderr)
+
+    def reasoning_of(self, *args):
+        r = self.dry(*args)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        argv = shlex.split(r.stdout)
+        self.assertEqual(argv.count("--reasoning"), 1)
+        return opt(argv, "--reasoning")
+
+    def test_reasoning_precedence(self):
+        """--reasoning flag when given, else the entry's reasoning, else off."""
+        self.assertEqual(self.reasoning_of(), "off", "neither: off")
+        for v in ("off", "on", "auto"):
+            with self.subTest(flag=v, entry=None):
+                self.assertEqual(self.reasoning_of("--reasoning", v), v)
+        for v in ("off", "on", "auto"):
+            with self.subTest(entry=v, flag=None):
+                self.entry_with(reasoning=v)
+                self.assertEqual(self.reasoning_of(), v, "entry, no flag: the entry's value")
+        for entry, flag in (("auto", "off"), ("auto", "on"), ("off", "auto"), ("on", "off"), ("off", "off")):
+            with self.subTest(entry=entry, flag=flag):
+                self.entry_with(reasoning=entry)
+                self.assertEqual(self.reasoning_of("--reasoning", flag), flag, "a given flag wins, off included")
+                self.assertEqual(self.reasoning_of("--reasoning", flag, "--", "--threads", "4"), flag)
+        self.entry_with(reasoning="auto")
+        r = self.t.run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(opt(self.t.rec()["argv"], "--reasoning"), "auto", "the real start gets the entry's value")
+        time.sleep(1.1)  # distinct log stamp
+        r = self.t.run("--reasoning", "off")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(opt(self.t.rec()["argv"], "--reasoning"), "off")
+
+    def template_of(self):
+        r = self.dry()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        argv = shlex.split(r.stdout)
+        if "--chat-template-file" not in argv:
+            return None
+        self.assertEqual(argv.count("--chat-template-file"), 1)
+        return opt(argv, "--chat-template-file")
+
+    def test_chat_template_field(self):
+        tpl_dir = self.t.root / "config" / "chat-templates"
+        (tpl_dir / "t2.jinja").write_text("{{ messages }} 2\n")
+        conf_tpl, entry_tpl = str(tpl_dir / "t.jinja"), str(tpl_dir / "t2.jinja")
+        self.assertIsNone(self.template_of(), "neither: the GGUF's embedded template")
+        self.entry_with(chat_template="config/chat-templates/t2.jinja")
+        self.assertEqual(self.template_of(), entry_tpl, "entry only")
+        self.t.conf.update(CHAT_TEMPLATE="config/chat-templates/t.jinja")
+        self.t.write_conf()
+        self.assertEqual(self.template_of(), entry_tpl, "the entry's chat_template overrides CHAT_TEMPLATE")
+        del self.t.entry["chat_template"]
+        self.t.write_manifest()
+        self.assertEqual(self.template_of(), conf_tpl, "no entry field: CHAT_TEMPLATE as before")
+        self.entry_with(chat_template="config/chat-templates/t2.jinja")
+        r = self.t.run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(opt(self.t.rec()["argv"], "--chat-template-file"), entry_tpl)
+
+    def test_chat_template_field_paths_refused(self):
+        """The entry's chat_template passes exactly the CHAT_TEMPLATE checks, with no
+        fallback to CHAT_TEMPLATE when it fails."""
+        tpl = self.t.root / "config" / "chat-templates" / "t.jinja"
+        (self.t.root / "models" / "x.jinja").write_text("{{ x }}\n")
+        (self.t.root / "config" / "link.jinja").symlink_to(tpl)
+        out = self.t.root / "tpl-out"
+        out.mkdir()
+        (out / "t.jinja").write_text("{{ y }}\n")
+        (self.t.root / "config" / "out").symlink_to(out)
+        outside = "outside %s/config" % self.t.root
+        cases = [
+            ("models/x.jinja", outside),
+            ("config/../models/x.jinja", "must be a plain repo-relative path"),
+            ("../x.jinja", "must be a plain repo-relative path"),
+            ("/etc/hosts", "must be a plain repo-relative path"),
+            ("config/./chat-templates/t.jinja", "must be a plain repo-relative path"),
+            ("config//chat-templates/t.jinja", "must be a plain repo-relative path"),
+            ("config/link.jinja", "is a symlink"),
+            ("config/out/t.jinja", outside),
+            ("config/missing.jinja", "chat template not found"),
+            ("config/chat-templates", "chat template not found"),
+            ("config/$(id).jinja", "has characters outside"),
+            ("config/t .jinja", "has characters outside"),
+        ]
+        self.t.conf.update(CHAT_TEMPLATE="config/chat-templates/t.jinja")
+        self.t.write_conf()
+        for value, msg in cases:
+            with self.subTest(chat_template=value):
+                self.entry_with(chat_template=value)
+                r = self.dry()
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertEqual(r.stdout, "")
+                self.assertIn("chat_template of manifest entry fake", r.stderr)
+                self.assertIn(msg, r.stderr)
+        self.entry_with(chat_template="config/missing.jinja")
+        r = self.t.run()
+        self.assertEqual(r.returncode, 1)
+        self.assertFalse(self.t.logs.exists(), "a refused template writes nothing")
+        self.assertFalse(self.t.record.exists(), "llama-server must not start")
+
+    def test_conf_template_still_checked_when_entry_overrides(self):
+        self.entry_with(chat_template="config/chat-templates/t.jinja")
+        self.t.conf.update(CHAT_TEMPLATE="config/missing.jinja")
+        self.t.write_conf()
+        r = self.dry()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("CHAT_TEMPLATE in", r.stderr)
+        self.assertIn("not found", r.stderr)
+
     def test_malformed_entries_refused(self):
         base = dict(self.t.entry)
         cases = [
@@ -613,7 +746,26 @@ class ServeTest(unittest.TestCase):
             ({"kv_type": "q3"}, "kv_type must be one of"),
             ({"kv_type": 16}, "kv_type must be one of"),
             ({"kv_type": ""}, "kv_type must be one of"),
+            ({"reasoning": "maybe"}, "reasoning must be one of the strings off, on, auto"),
+            ({"reasoning": "OFF"}, "reasoning must be one of"),
+            ({"reasoning": "auto "}, "reasoning must be one of"),
+            ({"reasoning": ""}, "reasoning must be one of"),
+            ({"reasoning": True}, "reasoning must be one of"),
+            ({"reasoning": False}, "reasoning must be one of"),
+            ({"reasoning": None}, "reasoning must be one of"),
+            ({"reasoning": 0}, "reasoning must be one of"),
+            ({"reasoning": ["auto"]}, "reasoning must be one of"),
+            ({"reasoning": {"mode": "auto"}}, "reasoning must be one of"),
+            ({"chat_template": 5}, "chat_template must be a non-empty"),
+            ({"chat_template": ""}, "chat_template must be a non-empty"),
+            ({"chat_template": None}, "chat_template must be a non-empty"),
+            ({"chat_template": True}, "chat_template must be a non-empty"),
+            ({"chat_template": ["config/chat-templates/t.jinja"]}, "chat_template must be a non-empty"),
+            ({"chat_template": "config/chat-templates/t.jinja\n--host"}, "chat_template must be a non-empty"),
+            ({"chat_template": "config/chat-templates/t.jinja\t"}, "chat_template must be a non-empty"),
             ({"sever_args": []}, "unknown field(s) sever_args"),
+            ({"reasonning": "auto"}, "unknown field(s) reasonning"),
+            ({"chat-template": "config/chat-templates/t.jinja"}, "unknown field(s) chat-template"),
             ({"default": "yes"}, "default must be true or false"),
             ({"repo": 5}, "repo must be a string"),
         ]
@@ -625,6 +777,7 @@ class ServeTest(unittest.TestCase):
                 self.assertEqual(r.returncode, 1, r.stdout)
                 self.assertEqual(r.stdout, "")
                 self.assertIn(msg, r.stderr)
+                self.assertIn("entry 'fake'", r.stderr, "the message names the entry")
 
     def test_non_finite_sampling_refused(self):
         for literal in ("NaN", "Infinity", "-Infinity"):
@@ -1146,11 +1299,20 @@ class ServeTest(unittest.TestCase):
 
     def test_bad_arguments(self):
         for args in (["--bogus"], ["--detach", "--dry-run"], ["--wait", "x", "--dry-run"],
-                     ["--reasoning", "maybe", "--dry-run"]):
+                     ["--reasoning", "maybe", "--dry-run"], ["--reasoning", "", "--dry-run"],
+                     ["--reasoning", "OFF"], ["--dry-run", "--reasoning"]):
             with self.subTest(args=args):
                 r = self.t.run(*args)
                 self.assertNotEqual(r.returncode, 0)
+                self.assertEqual(r.stdout, "")
                 self.assertFalse(self.t.record.exists())
+        self.entry_with(reasoning="auto")
+        r = self.t.run("--dry-run", "--reasoning", "maybe")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("--reasoning must be off, on or auto", r.stderr, "a bad flag is not replaced by the entry's value")
+        r = self.t.run("--help")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("else the manifest entry's \"reasoning\", else off", r.stderr)
 
 
 class StaticTest(unittest.TestCase):
@@ -1206,6 +1368,16 @@ class StaticTest(unittest.TestCase):
         self.assertEqual(sorted(longs + shorts), sorted(MAC_REFUSED))
         self.assertIn("# macOS build additions (NOT in serve.ps1)", text)
         self.assertEqual(set(REFUSED) & set(MAC_REFUSED), set(), "the two blocks do not overlap")
+
+    def test_one_template_check_for_both_sources(self):
+        """CHAT_TEMPLATE and a manifest entry's chat_template go through the same function."""
+        code = "\n".join(l for l in SERVE.read_text().splitlines() if not l.strip().startswith("#"))
+        self.assertEqual(code.count("check_template() {"), 1)
+        calls = re.findall(r'check_template "([^"]*)" "(\$[A-Z_]+)"', code)
+        self.assertEqual(calls, [("CHAT_TEMPLATE in $CONF", "$CFG_TEMPLATE"),
+                                 ("chat_template of manifest entry $CFG_MODEL_ID", "$M_TEMPLATE")])
+        self.assertEqual(code.count("--chat-template-file"), 1)
+        self.assertEqual(code.count("re_rel="), 1)
 
     def test_xtrace_off_first(self):
         for script in (SERVE, REPO / "scripts" / "stop.sh"):
