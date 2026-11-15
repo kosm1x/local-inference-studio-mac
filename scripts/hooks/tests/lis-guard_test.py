@@ -17,6 +17,7 @@ import json
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -3463,6 +3464,189 @@ def unplant_link(link):
             pass
 
 
+SPECIAL_TIMEOUT = 20                    # s per child; a hook that blocks is a FAIL, not a hang
+SPECIAL_DATA = b'rm -rf /z/x\n'         # pending in a pipe or FIFO the hook must not consume
+
+
+def special_child(arg):
+    """--special-child JSON: decide() on spec['cmd'] in this child process, printing one
+    JSON line {'d', 'left', 'raced', 'ctty'}. root: REPO_ROOT = cwd. fd3: an open, never
+    written pipe on fd 3. pending: report whether SPECIAL_DATA is still unread on stdin
+    (or on the race FIFO). race: os.open of spec['reg'] finds the FIFO spec['fifo'] there
+    (swapped in just before the open, the regular file put back right after it), with a
+    writer holding SPECIAL_DATA ('writer') or with no writer ('nowriter')."""
+    spec = json.loads(arg)
+    os.environ.pop(g.SESSION_START_ENV, None)
+    os.environ.pop(g.CONTAINER_ENV, None)
+    if spec.get('root'):
+        g.REPO_ROOT = os.path.normcase(os.path.realpath(spec['cwd']))
+    keep = []
+    if spec.get('fd3'):
+        r, w = os.pipe()
+        os.dup2(r, 3)
+        keep += [r, w]
+    ctty = None
+    if spec.get('ctty'):
+        try:
+            os.close(os.open('/dev/tty', os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY))
+            ctty = True
+        except OSError:
+            ctty = False
+    raced, rfd = [], None
+    race = spec.get('race')
+    if race:
+        reg, fifo = spec['reg'], spec['fifo']
+        aside = reg + '.aside'
+        if race == 'writer':
+            rfd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+            wfd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            os.write(wfd, SPECIAL_DATA)
+            keep += [wfd]
+        real_open = os.open
+
+        def racing_open(p, flags, *a, **k):
+            if p != reg or raced:
+                return real_open(p, flags, *a, **k)
+            raced.append(1)
+            os.rename(reg, aside)
+            os.rename(fifo, reg)
+            try:
+                return real_open(p, flags, *a, **k)
+            finally:
+                os.rename(reg, fifo)
+                os.rename(aside, reg)
+        os.open = racing_open
+    d = g.decide(spec['cmd'], spec['cwd'])
+    if race:
+        os.open = real_open
+    left = None
+    if spec.get('pending'):
+        fd = rfd if rfd is not None else 0
+        os.set_blocking(fd, False)
+        try:
+            left = os.read(fd, 4096) == SPECIAL_DATA
+        except BlockingIOError:
+            left = False
+    print(json.dumps({'d': d[0] if d else None, 'left': left, 'raced': bool(raced), 'ctty': ctty}))
+    return 0
+
+
+def special_run(spec, stdin='null'):
+    """The child's report for spec, 'TIMEOUT' when it blocked past SPECIAL_TIMEOUT, or
+    ('ERROR', text). stdin: 'null', 'pipe' (open, never written), 'data' (SPECIAL_DATA
+    written, the writer kept open) or 'tty' (a pty that is the child's controlling
+    terminal, never written). Only subprocess.run's own timeout ends a child."""
+    fds = []
+    kw = dict(capture_output=True, text=True, timeout=SPECIAL_TIMEOUT, start_new_session=True)
+    try:
+        if stdin == 'tty':
+            import fcntl
+            import pty
+            import termios
+            m, s = pty.openpty()
+            fds += [m, s]
+            kw.update(stdin=s, preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0))
+        elif stdin in ('pipe', 'data'):
+            r, w = os.pipe()                # the write end stays open here: no EOF
+            fds += [r, w]
+            if stdin == 'data':
+                os.write(w, SPECIAL_DATA)
+            kw['stdin'] = r
+        else:
+            kw['stdin'] = subprocess.DEVNULL
+        p = subprocess.run([sys.executable, '-I', os.path.abspath(__file__), '--special-child',
+                            json.dumps(spec)], **kw)
+    except subprocess.TimeoutExpired:
+        return 'TIMEOUT'
+    except (ImportError, OSError, subprocess.SubprocessError) as e:
+        return 'ERROR', repr(e)
+    finally:
+        for fd in fds:
+            os.close(fd)
+    try:
+        return json.loads(p.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return 'ERROR', p.stderr[-400:]
+
+
+def special_files():
+    """2026-11-14: check_script() and patch_hit() opened the named file with open(), so
+    `python /dev/stdin` blocked the hook (and hung this suite) on a silent stdin pipe, and
+    a FIFO or /dev/tty blocked it too. read_regular() never reads a file that is not
+    regular: each decision here runs in a child bounded by SPECIAL_TIMEOUT, so a
+    regression is a FAIL. Decisions are those of an unreadable file (None), and the stdin
+    rows keep their inline-code deny. Returns (checks, fails)."""
+    n = fails = 0
+    t = tempfile.mkdtemp()
+    try:
+        os.mkfifo(os.path.join(t, 'f.sh'))
+        os.symlink(os.path.join(t, 'f.sh'), os.path.join(t, 'l.sh'))
+        os.mkdir(os.path.join(t, 'd.py'))
+        for k in ('1', '2'):            # one pair per race row: a child that hangs mid-swap
+            os.mkfifo(os.path.join(t, 'q' + k))     # leaves only its own pair swapped
+            write(t, f'r{k}.sh', 'ls\n')
+        write(t, 'ro.sh', 'ls -la\n')
+        write(t, 'rm.sh', 'ls\nrm -rf "$HOME/x"\n')
+        write(t, 'big.sh', 'ls\n' * (g.SCRIPT_CAP // 3 + 1))    # read-only, over the cap
+        write(t, 'p.diff', '--- a/x\n+++ b/.claude/settings.json\n@@ -1 +1 @@\n-a\n+b\n')
+        r1, r2 = os.path.join(t, 'r1.sh'), os.path.join(t, 'r2.sh')
+        rows = [  # (command, stdin, want, extra spec)
+            ('python f.sh', 'null', None, {}),
+            ('bash f.sh', 'null', None, {}),
+            ('source f.sh', 'null', None, {}),
+            ('node f.sh', 'null', None, {}),
+            ('python l.sh', 'null', None, {}),
+            ('bash l.sh', 'null', None, {}),
+            ('python d.py', 'null', None, {}),
+            ('bash d.py', 'null', None, {}),
+            ('patch -i f.sh', 'null', None, {}),
+            ('git apply f.sh', 'null', None, {}),
+            ('patch < f.sh', 'null', None, {}),
+            ('python /dev/stdin', 'pipe', 'deny', {}),
+            ('node /dev/stdin', 'pipe', 'deny', {}),
+            ('bash /dev/stdin', 'pipe', 'deny', {}),
+            ('python /dev/fd/0', 'pipe', 'deny', {}),
+            ('git apply /dev/stdin', 'pipe', None, {}),
+            ('bash /dev/stdin', 'data', 'deny', {'pending': True}),
+            ('patch -i /dev/stdin', 'data', None, {'pending': True}),
+            ('python /dev/fd/3', 'null', 'deny', {'fd3': True}),
+            ('python /dev/tty', 'tty', None, {'ctty': True}),
+            ('bash /dev/tty', 'tty', None, {'ctty': True}),
+            ('patch -i /dev/tty', 'tty', None, {'ctty': True}),
+            ('bash /dev/zero', 'null', None, {}),
+            # regular files: still read and judged as before
+            ('bash ro.sh', 'null', 'allow', {}),
+            ('bash rm.sh', 'null', 'deny', {}),
+            ('bash big.sh', 'null', None, {}),
+            ('git apply p.diff', 'null', 'deny', {}),
+            ('bash r1.sh', 'null', 'allow', {}),        # a race file, no race: allow
+            # a FIFO swapped in at the open: the descriptor decides, never the path
+            (f'bash {r1}', 'null', None, {'race': 'nowriter', 'reg': r1, 'fifo': os.path.join(t, 'q1')}),
+            (f'bash {r2}', 'null', None, {'race': 'writer', 'pending': True,
+                                          'reg': r2, 'fifo': os.path.join(t, 'q2')}),
+        ]
+        for cmd, stdin, want, extra in rows:
+            spec = dict(cmd=cmd, cwd=t, root=True, **extra)
+            got = special_run(spec, stdin)
+            tag = f'{cmd.replace(t, "<tmp>")!r} stdin={stdin} {extra}'
+            if isinstance(got, dict) and got.get('ctty') is False:
+                print(f'SKIP special file: no controlling terminal in the child: {tag}')
+                continue
+            if isinstance(got, (tuple, list)) and stdin == 'tty':
+                print(f'SKIP special file: no pty here: {tag}: {got[1]}')
+                continue
+            n += 1
+            ok = (isinstance(got, dict) and got['d'] == want
+                  and (not extra.get('pending') or got['left'] is True)
+                  and (not extra.get('race') or got['raced'] is True))
+            if not ok:
+                fails += 1
+                print(f'FAIL special file want={want!r} got={got!r}: {tag}')
+    finally:
+        shutil.rmtree(t, ignore_errors=True)
+    return n, fails
+
+
 def main():
     os.environ.pop(g.SESSION_START_ENV, None)   # hermetic: rule 2 is set per check (S-B4)
     os.environ.pop(g.CONTAINER_ENV, None)       # hermetic: host; the W-19 block sets it
@@ -4559,6 +4743,9 @@ def main():
     k, f = mac_w25_bsd()
     n += k
     fails += f
+    k, f = special_files()
+    n += k
+    fails += f
     # ledger S-B3 audit C1: CRITICAL_PATH names the hook copies on its own, so a narrowed
     # any-mention rule still leaves a shell write to a copy critical
     n += 1
@@ -4789,4 +4976,6 @@ def main():
 
 
 if __name__ == '__main__':
+    if sys.argv[1:2] == ['--special-child'] and len(sys.argv) == 3:
+        sys.exit(special_child(sys.argv[2]))
     sys.exit(main())

@@ -2625,10 +2625,38 @@ def ps_literal_vars(text, full):
     return lits
 
 
+def read_regular(full, cap):
+    """The first cap characters of full (UTF-8, errors replaced), or None when it cannot
+    be opened or is not a regular file: a FIFO, a device (/dev/stdin, /dev/fd/N, /dev/tty,
+    /dev/zero), a socket or a directory is never read, so it never blocks the hook (a
+    silent stdin pipe hung the suite, 2026-11-14). The stat skips opening one at all; the
+    fstat of the descriptor, opened non-blocking and without taking a controlling
+    terminal, decides, so a swap of the path after the stat cannot make it read one."""
+    try:
+        if not stat.S_ISREG(os.stat(full).st_mode):
+            return None
+        fd = os.open(full, os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOCTTY', 0)
+                     | getattr(os, 'O_CLOEXEC', 0))
+    except (OSError, ValueError):       # ValueError: a NUL in the path
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        if getattr(os, 'O_NONBLOCK', 0):
+            os.set_blocking(fd, True)
+        with open(fd, encoding='utf-8', errors='replace', closefd=False) as f:
+            return f.read(cap)
+    except (OSError, ValueError):
+        return None
+    finally:
+        os.close(fd)
+
+
 def check_script(path, kind, cwd):
     """'allow' when every line is read-only, ('deny', reason) for the first critical
-    line, None (no decision) when the file is unreadable, over the read cap, or a line
-    is neither read-only nor a critical write."""
+    line, None (no decision) when the file is unreadable (or not a regular file, which
+    is never opened for reading: read_regular), over the read cap, or a line is neither
+    read-only nor a critical write."""
     full = resolve(path, cwd)
     if is_unc(full):
         return None                     # never opened or resolved (A13 W2)
@@ -2638,10 +2666,8 @@ def check_script(path, kind, cwd):
         return None
     if real in EXEMPT_SCRIPTS:
         return None                     # the exempt files: they quote denied shapes
-    try:
-        with open(full, encoding='utf-8', errors='replace') as f:
-            text = f.read(SCRIPT_CAP + 1)
-    except (OSError, ValueError):       # ValueError: a NUL in the path (property test)
+    text = read_regular(full, SCRIPT_CAP + 1)
+    if text is None:                    # unreadable, a NUL in the path (property test), not a file
         return None
     if len(text) > SCRIPT_CAP:          # over the cap: never allow (C5)
         return None
@@ -2701,10 +2727,8 @@ def patch_hit(cmd, cwd):
         for f in files[:8]:
             if is_unc(resolve(f.strip('\'"'), cwd)):
                 continue                # never opened (A13 W2); critical() has scanned the command
-            try:
-                with open(resolve(f.strip('\'"'), cwd), encoding='utf-8', errors='replace') as fh:
-                    text = fh.read(SCRIPT_CAP)
-            except (OSError, ValueError):   # ValueError: a NUL in the path
+            text = read_regular(resolve(f.strip('\'"'), cwd), SCRIPT_CAP)
+            if text is None:            # unreadable, a NUL in the path, or not a regular file
                 continue
             for m in re.finditer(r'(?m)^(?:\+\+\+|---|diff --git|rename to|copy to)\s+(.+)$', text):
                 if CRITICAL_PATH.search(' ' + m.group(1)):

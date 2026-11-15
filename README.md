@@ -213,6 +213,13 @@ The hook suites (`scripts/hooks/tests/*_test.py`) and the template check are lis
   (`'rm' -rf x`, `find . "-delete"`), and shapes past the bounds above. The reference's container-profile part
   of W-25 is in the code but inert here (no `LIS_CONTAINER`). The reference's W-19 (curl
   upload judgement) is not ported.
+- The guard reads a script or patch file only when it is a regular file. A FIFO, a
+  device (`/dev/stdin`, `/dev/tty`), a socket or a directory is never read, so the hook
+  cannot block on one: before 2026-11-14 it could (and `lis-guard_test.py` hung when run
+  with an open stdin). Not reading it yields no decision from the file's content; rules
+  that judge the command text still apply, so `python /dev/stdin` and the other
+  code-on-stdin forms are still refused. Whether running an interpreter on a FIFO or
+  another device should be refused is an open operator decision.
 - One server, one slot (`-np 1`). The launcher warns when the slot is busy
   (`--strict-slot` refuses instead).
 
