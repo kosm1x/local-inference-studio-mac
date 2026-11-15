@@ -57,8 +57,14 @@ the reference checkout, where present, is read-only).
 - Sessions started by `scripts/claude-local.sh` run their Bash tool in `/bin/bash`, not
   the login zsh: the launcher pins `CLAUDE_CODE_SHELL=/bin/bash` and `SHELL=/bin/bash`
   (process env and `--settings` file), because `lis-guard.py` models bash syntax only.
-  `~/.zshrc` aliases and functions are not applied there (`~/.bashrc` is, if present).
-  UNVERIFIED on client 2.1.325 until a live session shows `$BASH_VERSION`.
+  `~/.zshrc` aliases and functions are not applied there (`~/.bashrc` is, if present,
+  per the client documentation; UNVERIFIED).
+  Seen live on client 2.1.325 in print mode (2026-11-15,
+  `bench/results/20261115-live-guard-check/`): `echo =ls` gave `=ls` and
+  `shopt -p extglob` gave `shopt -u extglob`, so the tool ran bash; the version string
+  was not observed. Probe without `$`: in print mode the client itself refused a command
+  with a variable expansion. Re-check after a client upgrade. The launcher does
+  not defend itself against the shell that starts it (README, Known limits).
 - Python is `/opt/homebrew/bin/python3.13`, run with `-I` for anything that reads
   untrusted input.
 - Text with quotes or backslashes goes through the Write tool, not a Bash heredoc or

@@ -60,8 +60,9 @@
 # DISABLE_PROMPT_CACHING=1, ENABLE_TOOL_SEARCH=false, CLAUDE_CODE_ATTRIBUTION_HEADER=0,
 # LIS_SESSION_START (ISO 8601 UTC, 6 fraction digits), and CLAUDE_CODE_SHELL=/bin/bash
 # and SHELL=/bin/bash (the session shell: the Bash tool runs bash, the syntax lis-guard
-# models, not the zsh of $SHELL; UNVERIFIED on 2.1.325 until a live session shows
-# $BASH_VERSION). Removed from the inherited env at
+# models, not the zsh of $SHELL; seen on 2.1.325 in print mode on 2026-11-15 via `echo =ls`
+# and `shopt -p extglob`; the version string was not observed, as the client refuses a
+# command with a `$` variable there). Removed from the inherited env at
 # the very top, before serve.sh or anything else runs (the environment step lists them):
 # every inherited ANTHROPIC_*, CLAUDE_CODE_* and LIS_* variable (ANTHROPIC_API_KEY,
 # CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CODE_SUBAGENT_MODEL(_FORCE), CLAUDE_CODE_USE_BEDROCK/
@@ -72,8 +73,8 @@
 # inherited SHELLOPTS is switched off (set +xv) and unexported. The process env
 # then points claude at the loopback server only; settings files can still set env
 # (the per-run file pins ANTHROPIC_BASE_URL to the same loopback URL and the session
-# shell, and a project file that sets ANTHROPIC_*, CLAUDE_CODE_*, SHELL, CLAUDE_ENV_FILE
-# or a proxy variable refuses the launch), and
+# shell, and a project file that sets ANTHROPIC_*, CLAUDE_CODE_*, SHELL, CLAUDE_ENV_FILE,
+# a bash start-up name (see PROJECT_PY) or a proxy variable refuses the launch), and
 # whether a flag-level value beats a project one is UNVERIFIED (see below). The key is
 # never in an argument list (curl gets its header from stdin with -K -, printf being a
 # builtin), never in a settings file, never logged and never printed.
@@ -84,10 +85,12 @@
 # pins, ANTHROPIC_BASE_URL, CLAUDE_CODE_SHELL and SHELL, and disableAllHooks false. That
 # these flag-level values win
 # over the project and local files of the working directory is UNVERIFIED on this client
-# (2.1.322): the launcher therefore refuses to start when <cwd>/.claude/settings.json or
+# (2.1.322 when written, 2.1.325 now): the launcher therefore refuses to start when <cwd>/.claude/settings.json or
 # settings.local.json holds apiKeyHelper, disableAllHooks, hooks, a permissions.defaultMode
 # other than manual/acceptEdits/plan/default, or an env name starting ANTHROPIC_ or
-# CLAUDE_CODE_, SHELL, CLAUDE_ENV_FILE or a proxy variable (or cannot be parsed). Under
+# CLAUDE_CODE_, SHELL, CLAUDE_ENV_FILE, BASH_ENV, ENV, HOME, POSIXLY_CORRECT, INPUTRC,
+# SHELLOPTS, BASHOPTS, PS1, PS2, PS4, PROMPT_COMMAND, a name starting BASH_FUNC_, or a
+# proxy variable (or cannot be parsed); env.PATH is not refused (open). Under
 # --user-scope and --full the user settings load too and are never read here: an env
 # entry there (SHELL, CLAUDE_CODE_SHELL_PREFIX, CLAUDE_ENV_FILE, ...) applies; for the
 # two shell names the per-run file's pin is documented to outrank it (UNVERIFIED), for
@@ -95,13 +98,47 @@
 # top level's .claude instead of the cwd's when started in a subdirectory is UNVERIFIED.
 # The user-scope CLAUDE.md still loads under --setting-sources (reference finding on
 # Windows; UNVERIFIED on macOS). That this claude build honours --setting-sources the same
-# way is UNVERIFIED (no real session was started for this port).
+# way is UNVERIFIED: real runs on 2026-11-14 were one session of 237 requests (client
+# version not recorded) and a print run capped at --max-turns 2 (2.1.325), but neither
+# checked whether ~/.claude/settings.json stayed out or the user-scope CLAUDE.md loaded.
 #
 # Out of scope for this port: -LisWeb/-LisWebAuto/-LisTerminal/-LisKeepState (the lis-web
 # container), -LisTask profiles and the longrun relaunch supervisor (so facts-inject.py is
 # never registered), LIS_CLAUDE_EXE (the tests put stubs first on PATH instead).
 set +xv    # an inherited SHELLOPTS=xtrace or verbose would print the key
+# Exported functions (BASH_FUNC_<name>%% in the env): bash imports each as a function and
+# exports it again to every child, so the client's Bash tool (bash, see SESSION_SHELL)
+# and serve.sh would run it in place of the command it names (BASH_FUNC_ls%% replaces
+# ls). No function is defined here yet, so every one listed is an imported one: all are
+# removed before die and say are defined (a redefined function keeps its export flag).
+# Outside posix mode bash 3.2 imports names that are no identifier too (-x, --, a-b,
+# a.b), hence the -- before the name. The loop condition is a keyword test, so the loop
+# ends whatever the caller exported. If a function is still listed afterwards, the launch
+# fails closed. A BASH_FUNC_ entry that is no function definition is not imported, stays
+# in the env as it is and is inert in bash 3.2.
+# Limit: the launcher does not defend itself against the shell that starts it (seen with
+# echo-only stand-ins on bash 3.2): a caller BASH_ENV is sourced by this bash before its
+# first line; a caller function named builtin replaces every `builtin X` here, so it
+# defeats the removal and the check and reaches the client; a caller function named set
+# runs once, in place of the first line, outside posix mode, and is then removed.
+fns=$(builtin declare -F)
+while [[ -n $fns ]]; do
+    fn=${fns%%$'\n'*}
+    case $fns in *$'\n'*) fns=${fns#*$'\n'} ;; *) fns= ;; esac
+    case $fn in 'declare -f'*' '*) builtin unset -f -- "${fn#declare -f* }" ;; esac
+done
+case $(builtin declare -F) in
+    '') ;;
+    *) builtin printf 'claude-local: %s\n' 'an exported shell function survived the removal; refusing to start (unexport it in the calling shell).' >&2
+       builtin exit 1 ;;
+esac
+set +xv    # again: a caller function named set (removed above) replaced the first one
+unset fns fn
 set -u
+# An inherited POSIXLY_CORRECT starts bash in posix mode, before any line here runs. The
+# environment scrub below unsets the variable, which also leaves posix mode in 3.2.57;
+# this line leaves it before that, for the lines in between.
+set +o posix
 umask 077
 # SHELLOPTS stays exported after set +x when it came from the env (every child bash, the
 # client's Bash tool included, would inherit nounset); BASHOPTS likewise for bash >= 4.
@@ -123,6 +160,11 @@ say() { printf 'claude-local: %s\n' "$*" >&2; }
 #   shell and Python start-up: BASH_ENV, ENV, every PYTHON* (the hooks run python3.13 -I,
 #     which needs none); the dynamic loader: every DYLD_* (SIP already strips these when
 #     /bin/bash starts);
+#   what bash runs or reads at start-up or around a command, beyond BASH_ENV and ENV (man
+#     bash of 3.2): PS4 (expanded, $( ) included, before each traced command), PS1, PS2
+#     and PROMPT_COMMAND (interactive shells only), POSIXLY_CORRECT (posix mode: other
+#     start-up files, other parsing), INPUTRC (readline's start-up file); SHELLOPTS is
+#     unexported and BASHOPTS unset above, exported functions (BASH_FUNC_*) removed above;
 #   another config dir and the markers of a parent agent session: CLAUDE_CONFIG_DIR,
 #     CLAUDECODE, CLAUDE_EFFORT, CLAUDE_PID, AI_AGENT;
 #   what the client runs around or before each shell command: CLAUDE_ENV_FILE (a script
@@ -141,6 +183,7 @@ for name in $(compgen -e); do
             NODE_OPTIONS | NODE_EXTRA_CA_CERTS | BUN_* | SSL_CERT_FILE | SSL_CERT_DIR | \
             CURL_CA_BUNDLE | REQUESTS_CA_BUNDLE | \
             BASH_ENV | ENV | PYTHON* | \
+            PS1 | PS2 | PS4 | PROMPT_COMMAND | POSIXLY_CORRECT | INPUTRC | \
             DYLD_* | \
             CLAUDE_CONFIG_DIR | CLAUDECODE | CLAUDE_EFFORT | CLAUDE_PID | AI_AGENT | \
             CLAUDE_ENV_FILE)
@@ -459,8 +502,9 @@ fi
 # The working directory's project settings (claude reads <cwd>/.claude/settings.json and
 # settings.local.json in every mode here). Whether the --settings file outranks them key
 # by key is UNVERIFIED on this client, so a project file that could re-route the key,
-# switch hooks off, add hooks, widen the permission mode or change the session shell (env
-# CLAUDE_CODE_SHELL, SHELL, CLAUDE_CODE_SHELL_PREFIX, CLAUDE_ENV_FILE) refuses the launch. Parsed as
+# switch hooks off, add hooks, widen the permission mode, change the session shell (env
+# CLAUDE_CODE_SHELL, SHELL, CLAUDE_CODE_SHELL_PREFIX, CLAUDE_ENV_FILE) or plant code in
+# its start-up (SHELL_ENV below, any BASH_FUNC_ name) refuses the launch. Parsed as
 # JSON; an unreadable or unparseable file refuses too. Names only, never a value.
 IFS= read -r -d '' PROJECT_PY <<'PYEOF'
 import json
@@ -468,8 +512,14 @@ import os
 
 MODES = {'manual', 'acceptEdits', 'plan', 'default'}
 PROXY = {'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy'}
-# The session shell and what the client runs around or before each shell command.
-SHELL_ENV = {'CLAUDE_CODE_SHELL', 'SHELL', 'CLAUDE_CODE_SHELL_PREFIX', 'CLAUDE_ENV_FILE'}
+# The session shell, what the client runs around or before each shell command, and what
+# bash 3.2 runs or reads at start-up or around a command (man bash): start-up files
+# (BASH_ENV, ENV, HOME for ~/.bash_profile and ~/.bashrc, POSIXLY_CORRECT, INPUTRC),
+# options (SHELLOPTS, BASHOPTS), code in prompts and traces (PS1, PS2, PS4,
+# PROMPT_COMMAND) and exported functions (any BASH_FUNC_ name).
+SHELL_ENV = {'CLAUDE_CODE_SHELL', 'SHELL', 'CLAUDE_CODE_SHELL_PREFIX', 'CLAUDE_ENV_FILE',
+             'BASH_ENV', 'ENV', 'HOME', 'POSIXLY_CORRECT', 'INPUTRC', 'SHELLOPTS', 'BASHOPTS',
+             'PS1', 'PS2', 'PS4', 'PROMPT_COMMAND'}
 found = []
 for name in ('settings.json', 'settings.local.json'):
     path = os.path.join(os.getcwd(), '.claude', name)
@@ -498,8 +548,11 @@ for name in ('settings.json', 'settings.local.json'):
     env = d.get('env')
     if isinstance(env, dict):
         for k in env:
-            if (k.upper().startswith(('ANTHROPIC_', 'CLAUDE_CODE_')) or k.lower() in PROXY
-                    or k.upper() in SHELL_ENV):
+            # compared without surrounding whitespace (whether the client trims a key is
+            # UNVERIFIED) and without case; the message shows the key as written
+            n = k.strip().upper()
+            if (n.startswith(('ANTHROPIC_', 'CLAUDE_CODE_', 'BASH_FUNC_')) or n.lower() in PROXY
+                    or n in SHELL_ENV):
                 found.append(f'{rel}: key env.{json.dumps(k)[1:-1]}')
     elif 'env' in d:
         found.append(f'{rel}: key env is not an object')

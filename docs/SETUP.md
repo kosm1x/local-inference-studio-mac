@@ -192,25 +192,58 @@ From the project directory you want to work in:
 <repo>/scripts/claude-local.sh -p "<task>" --permission-mode acceptEdits
 ```
 
-- The launcher prints `user scope: off`, `guard: on` and `context tokens: 114688` on
-  stderr. The client then printed `[claude-code:unrecognized_model]` and a note that
-  claude.ai connectors are disabled; both appeared in the working session too.
-- The launcher also prints `session shell: /bin/bash (pinned as CLAUDE_CODE_SHELL and
-  SHELL)` (added after that session). The session's Bash tool runs `/bin/bash` 3.2
-  rather than your login zsh, because the guard hook reads commands as bash syntax: the
-  aliases, functions and options of `~/.zshrc` are not applied to tool commands, and per
-  Claude Code's documentation `~/.bashrc` is sourced instead if present. The launcher
-  refuses to start if `/bin/bash` is missing, not an executable regular file, or owned
-  by anyone but root and you or writable by everyone, and removes an inherited
-  `CLAUDE_CODE_SHELL_PREFIX` or `CLAUDE_ENV_FILE`. The pin is UNVERIFIED on 2.1.325: in
-  the first session after this change, ask for `echo "$BASH_VERSION"` and expect
-  `3.2.57(1)-release`.
+- After the hook-copies line, the launcher prints three status lines on stderr; on
+  2026-11-15 they were (`bench/results/20261115-live-guard-check/s1.err`):
+
+  ```
+  claude-local: user scope: off (S-O3)
+  claude-local: profile: none   guard: on   context tokens: 114688
+  claude-local: session shell: /bin/bash (pinned as CLAUDE_CODE_SHELL and SHELL)
+  ```
+
+  The first two date from the port's first commit; the session shell line came with the
+  pin. The client then printed a note that claude.ai connectors are disabled and
+  `[claude-code:unrecognized_model]`, as in the first working session.
+- The session's Bash tool runs `/bin/bash` 3.2 rather than your login zsh, because the
+  guard hook reads commands as bash syntax: the aliases, functions and options of
+  `~/.zshrc` are not applied to tool commands, and per Claude Code's documentation
+  `~/.bashrc` is sourced instead if present (UNVERIFIED). The launcher refuses to start
+  if `/bin/bash` is missing, not an executable regular file, or owned by anyone but root
+  and you or writable by everyone, and removes an inherited `CLAUDE_CODE_SHELL_PREFIX` or
+  `CLAUDE_ENV_FILE`, the bash functions exported from your shell (it refuses to start if
+  one survives; a malformed `BASH_FUNC_` entry, which bash does not import, passes through
+  inert) and bash start-up variables such as `PS4` and `PROMPT_COMMAND` (README, Known
+  limits, has the list and the limit: the launcher does not defend itself against the
+  shell that starts it).
+- Seen live on client 2.1.325 in print mode (2026-11-15, `s6` and `s7` in
+  `bench/results/20261115-live-guard-check/`): `echo =ls` returned `=ls` (zsh would print
+  a path) and `shopt -p extglob` returned `shopt -u extglob` with exit 1 (bash's normal
+  status for an unset option; zsh has no `shopt`), so the Bash tool ran bash. The version
+  string was not observed; 3.2 follows from the pinned path. Use these variable-free
+  probes: in print mode the client itself, not the hook, refused `echo "BV=$BASH_VERSION
+  ZV=$ZSH_VERSION S=$SHELL"` with "A variable in this command can't be checked before it
+  runs" (`s1`). `shopt -p extglob` ran under `--allowedTools 'Bash(shopt -p
+  extglob)'` (as reported in `NOTES.txt`; the `s7` log does not record its arguments;
+  without a grant it was not tried); `echo =ls` ran without a grant. Re-check after a
+  client upgrade.
 - In print mode (`-p`) nobody can answer a permission prompt: a command that needs one
-  comes back "This command requires approval". The first working session (237 requests,
-  per the commit that added the patched template) fixed its fixture bug correctly but
-  never ran the tests for that reason, and the guard also refuses inline `python3 -c` and
-  running a file written in the same session. Pre-approve the test command
-  (`--allowedTools`; not yet tried here, UNVERIFIED) or work interactively.
+  comes back "This command requires approval" (first working session; live, `s9`) or,
+  for a command an ask row matches, "Claude requested permissions to use Bash, but you
+  haven't granted it yet." (live, 2026-11-15, `s4b`, `s10`). The first working session
+  (237 requests, per the commit that added the patched template) fixed its fixture bug
+  correctly but never ran the tests for that reason, and the guard also refuses inline
+  `python3 -c` and running a file written in the same session. Pre-approve the test
+  command with `--allowedTools` or work interactively. Tried live: the glob grant
+  `Bash(curl *)` let `curl https://example.invalid/x` run, which was refused without it
+  (`s8` against `s9`; no settings row matches that command and the hook does not decide
+  it, `step0.out`); the exact grant `Bash(shopt -p extglob)` ran that command (`s7`, grant
+  as reported in `NOTES.txt`, not recorded in the log; no row, no hook decision). A grant did not get `curl -d x http://127.0.0.1:9/x` past the
+  ask row `Bash(curl -d*)` (`s4b`, `s10`; limits in README, Known limits).
+- Judge a session by its tool results, not by the model's closing text: in the live
+  check the closing prose called a hook deny, a client refusal and failed curls
+  "executed" or "successfully executed" (`s2b`, `s4b`, `s5b`, `s8`) and a refusal
+  "running" (`s10`), and three first prompts got a text reply with no tool call (`s2`,
+  `s4`, `s5`).
 - Give a headless session a time bound and read its transcript after a few minutes. That
   session sent one refused command 219 times in a row until it was stopped by hand.
 - In print mode the launcher adds `--max-turns 60` (stderr: `print mode without
@@ -244,7 +277,8 @@ with `pkill`, `killall` or a computed kill.
 | `smoke.sh` / `bench/run.sh`: `no key file ...` | No server has started since `logs/` was cleared. Start one. |
 | `chat_template_check.py`: `FAIL: no server at ...` | Start the server (step 7). |
 | Bench `tools` low, misses are `no_call` | Replay those prompts and read the replies: an invented answer points at the reasoning setting (the default model needs `auto`); a tool call printed as text points at the template. |
-| `-p` session: "This command requires approval" | Print mode cannot answer prompts; pre-approve the command or run interactively. |
+| `-p` session: "This command requires approval" or "Claude requested permissions to use Bash, but you haven't granted it yet." | Print mode cannot answer prompts; pre-approve the command (`--allowedTools`) or run interactively. The second text came for a command that only an ask row matches (this repo's model of the client's matching), under a `Bash(curl *)` grant that did let an unmatched curl run: the grant did not override the ask row (live, 2026-11-15, `s8`-`s10`; the client does not name the rule). |
+| `-p` session: "A variable in this command can't be checked before it runs" | The client itself, not the hook, refused a command with a variable expansion (seen once, in print mode on 2.1.325, for `echo "BV=$BASH_VERSION ..."`). Use a command without `$`. |
 | The model repeats one refused command | Known limit. A print-mode run stops at its turn cap (`--max-turns`, default 60); an interactive one must be stopped by hand. |
 | Replies slow down as a session grows | Expected: decode falls with context depth (README). |
 | `claude-local: bash (the session shell) ...` | `/bin/bash` failed the launcher's tool check (missing, not an executable file, foreign owner or writable by everyone). The launcher uses that fixed path only, never a Homebrew bash or `PATH`. |

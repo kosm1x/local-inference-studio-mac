@@ -34,12 +34,21 @@ whatever the caller held (zsh, a missing path, empty), the caller's
 CLAUDE_CODE_SHELL_PREFIX and CLAUDE_ENV_FILE are cleared, a project file naming any of the
 four refuses, the status line names the shell, and the /bin/bash check refuses a
 missing, non-executable, world-writable or relative path (swapped into the test copy).
+Bash start-up: exported functions (BASH_FUNC_*) and PS4, PROMPT_COMMAND, POSIXLY_CORRECT,
+INPUTRC from the caller reach neither serve.sh nor claude, and a project file whose env
+names a bash start-up variable or a BASH_FUNC_ name refuses (surrounding whitespace
+ignored). Exported functions named -x, --, -, -f, a-b, a.b, ls, say, which bash imports
+outside posix mode only, are removed in runs without POSIXLY_CORRECT too, and a surviving
+one (removal swapped out of the test copy) refuses the launch. Every bash 3.2 builtin
+(plus ls, die, say) as a caller function, one per run: every run ends, only set and
+builtin run (the documented limit), and every other name launches with no function.
 W-19: no curl upload
 deny in config/claude-settings.json (none re-spelled), the curl upload ask rows present, no
 allow row for curl, wget or any command, no allow row matching an upload, no deny and some
 ask row matching each loopback upload, and lis-guard denying the non-loopback ones.
 Stdlib only. Nothing here starts a real server or a real claude.
 """
+import concurrent.futures
 import importlib.util
 import json
 import os
@@ -106,6 +115,14 @@ POISON = {
     'CLAUDE_CODE_SHELL': '/bin/zsh',
     'CLAUDE_CODE_SHELL_PREFIX': '/nonexistent/poison-shell-prefix',
     'CLAUDE_ENV_FILE': '/nonexistent/poison-env-file',
+    # what bash runs or reads at start-up or around a command (benign values), and exported
+    # functions (bash imports these as functions; serve.sh records `declare -F` for them)
+    'PS4': '+$(echo poison-ps4) ',
+    'PROMPT_COMMAND': 'echo poison-prompt-command',
+    'POSIXLY_CORRECT': '1',
+    'INPUTRC': '/nonexistent/poison-inputrc',
+    'BASH_FUNC_ls%%': '() { echo poison-ls; }',
+    'BASH_FUNC_say%%': '() { echo poison-say; }',
     # the server's test overrides: must not reach serve.sh --detach
     'LIS_TEST_LLAMA_SERVER': '/nonexistent/poison-llama-server',
     'LIS_TEST_LLAMA_EXE': '/nonexistent/poison-llama-exe',
@@ -211,6 +228,7 @@ SERVE_STUB = '''#!/bin/bash
 T='{t}'
 printf '{{"who":"serve","argv":["%s"]}}\\n' "$*" >> "$T/calls.jsonl"
 compgen -e > "$T/state/serve-env"
+declare -F > "$T/state/serve-funcs"
 printf '%s\\n' "$-" > "$T/state/serve-flags"
 [ -e "$T/state/serve-fails" ] && exit 1
 printf '%s\\n' '{key}' > "$T/repo/logs/api-key"
@@ -269,10 +287,10 @@ class Env:
         if busy:
             self.write('state/busy', '')
 
-    def run(self, *args):
+    def run(self, *args, timeout=120):
         return subprocess.run(['/bin/bash', os.path.join(self.repo, 'scripts', 'claude-local.sh'), *args],
                               env=self.env, cwd=os.path.join(self.t, 'work'),
-                              capture_output=True, text=True, timeout=120)
+                              capture_output=True, text=True, timeout=timeout)
 
     def serve_env(self):
         """The exported names serve.sh saw, or None when it never ran."""
@@ -301,6 +319,12 @@ def kind(c):
     if c['who'] == 'curl':
         return 'curl /' + c['argv'][-1].rsplit('/', 1)[-1]
     return c['who']
+
+
+# Trace lines bash prints while a caller set function keeps xtrace on: the removal loop for
+# the POISON functions and set, a handful of lines per function. The bound leaves room for
+# a few more functions; the launcher past the removal traces hundreds of lines.
+XTRACE_REMOVAL_LINES = 40
 
 
 def no_key(e, r, label):
@@ -344,6 +368,21 @@ def static_order():
     code = [ln for ln in src.splitlines() if ln.strip() and not ln.lstrip().startswith('#')]
     check(code[0].startswith('set +xv'), f'xtrace off first thing: {code[0]!r}')
     check('export -n SHELLOPTS' in src, 'an inherited SHELLOPTS is unexported')
+    # exported functions: removed before the script defines any (a redefined one stays exported)
+    fx = src.find('builtin unset -f')
+    check(0 <= fx < src.find('\ndie() {') and fx < scrub and src.find('fns=$(builtin declare -F)') < fx,
+          'env: imported functions removed before die() and the variable scrub')
+    check('builtin unset -f -- "${fn#declare -f* }"' in src, 'env: function names after --, so -x is removed too')
+    # nothing but set +xv runs before the removal, whose loop condition is a keyword test
+    # (builtin_sweep checks the behaviour), and set +xv runs again after the check
+    check(code[:3] == ['set +xv    # an inherited SHELLOPTS=xtrace or verbose would print the key',
+                       'fns=$(builtin declare -F)', 'while [[ -n $fns ]]; do'],
+          f'env: the removal comes right after set +xv: {code[:3]!r}')
+    fail_closed = src.find("an exported shell function survived the removal")
+    check(0 < fail_closed < src.find('\nset +xv    # again') < src.find('\nset -u\n'),
+          'env: set +xv again after the fail-closed check, before set -u')
+    check(src.find('set +o posix') < src.find('\ndie() {') and 'set +o posix' in src,
+          'env: posix mode (an inherited POSIXLY_CORRECT) switched off first')
     # SIP strips DYLD_* before /bin/bash starts, so no run can show the unset: read it.
     check(re.search(r'[|\\]\s*DYLD_\*\s*\|', src[scrub:pos[0]]) is not None, 'env: DYLD_* is in the cleared set')
     # tool locations: python3.13 from Homebrew folders, curl from /usr/bin, never PATH
@@ -566,6 +605,15 @@ def start_server():
             check(not leaked, f'--start-server: scrubbed before serve.sh, leaked {leaked}')
             check('LIS_TEST_LLAMA_SERVER' not in se and 'LIS_TEST_LLAMA_EXE' not in se,
                   '--start-server: LIS_TEST_LLAMA_SERVER / _EXE do not reach serve.sh')
+        with open(os.path.join(e.t, 'state', 'serve-funcs')) as f:
+            funcs = f.read()
+        check(funcs == '', f'--start-server: no exported function reaches serve.sh: {funcs!r}')
+        check(not any(k.startswith('BASH_FUNC_') for k in cl['env']),
+              f'--start-server: no BASH_FUNC_ name reaches claude: {sorted(k for k in cl["env"] if k.startswith("BASH_FUNC_"))}')
+        # the launcher's own say() ran, not the caller's exported say (BASH_FUNC_say%%)
+        check('poison-say' not in r.stderr and 'poison-say' not in r.stdout
+              and 'claude-local: user scope: off (S-O3)' in r.stderr,
+              f'--start-server: the launcher\'s say() is its own: {r.stderr[-200:]!r}')
     finally:
         e.close()
     # an inherited SHELLOPTS=xtrace (and verbose) prints nothing of the key, and reaches no child
@@ -583,6 +631,24 @@ def start_server():
         check('SHELLOPTS' not in se and 'x' not in flags and 'v' not in flags and 'u' not in flags,
               f'SHELLOPTS=xtrace: serve.sh inherits no shell options (flags {flags!r})')
         check(not cl or 'SHELLOPTS' not in cl[0]['env'], 'SHELLOPTS=xtrace: claude gets no SHELLOPTS')
+    finally:
+        e.close()
+    # the same with a caller function named set (no posix mode): it replaces the first
+    # set +xv, so xtrace stays on through the function removal; the second set +xv, after
+    # the removal, must switch it off before anything reads the key
+    e = Env()
+    try:
+        e.env.pop('POSIXLY_CORRECT', None)
+        e.env['SHELLOPTS'] = 'xtrace'
+        e.env['BASH_FUNC_set%%'] = '() { /bin/echo stand-in-set; }'
+        r = e.run('--start-server', '-p', 'x')
+        label = 'SHELLOPTS=xtrace and a caller set function'
+        cl = [c for c in e.calls() if c['who'] == 'claude']
+        check(r.returncode == 0 and len(cl) == 1, f'{label}: launches: {r.returncode} {r.stderr[-200:]!r}')
+        no_key(e, r, label)
+        trace = [ln for ln in r.stderr.splitlines() if ln.startswith('+')]
+        check(len(trace) <= XTRACE_REMOVAL_LINES,
+              f'{label}: at most {XTRACE_REMOVAL_LINES} trace lines (the removal only): {len(trace)}')
     finally:
         e.close()
     e = Env()
@@ -930,6 +996,31 @@ PROJECT_REFUSALS = [
      ['env.CLAUDE_ENV_FILE'], ['/x/env-script.sh']),
     ('settings.json', '{"env": {"FOO": "1", "SHELL": "/bin/bash", "CLAUDE_ENV_FILE": "/x/e"}}',
      ['env.SHELL', 'env.CLAUDE_ENV_FILE'], []),
+]
+# what bash runs or reads at start-up or around a command: each name in both files
+BASH_STARTUP_ENV = ['BASH_ENV', 'ENV', 'HOME', 'POSIXLY_CORRECT', 'INPUTRC', 'SHELLOPTS', 'BASHOPTS',
+                    'PS1', 'PS2', 'PS4', 'PROMPT_COMMAND']
+PROJECT_REFUSALS += [(f, json.dumps({'env': {n: '/x/planted-value'}}), [f'env.{n}'], ['/x/planted-value'])
+                     for n in BASH_STARTUP_ENV for f in ('settings.json', 'settings.local.json')]
+PROJECT_REFUSALS += [
+    ('settings.json', '{"env": {"Bash_Env": "/x/planted-value"}}', ['env.Bash_Env'], ['/x/planted-value']),
+    ('settings.json', '{"env": {"BASH_FUNC_x%%": "() { echo planted; }"}}', ['env.BASH_FUNC_x%%'], ['planted']),
+    ('settings.local.json', '{"env": {"BASH_FUNC_ls%%": "() { echo planted; }"}}', ['env.BASH_FUNC_ls%%'], ['planted']),
+    ('settings.json', '{"env": {"bash_func_ls%%": "() { echo planted; }"}}', ['env.bash_func_ls%%'], ['planted']),
+    ('settings.json', '{"env": {"FOO": "1", "PS4": "+$(x) ", "BASH_FUNC_cd%%": "() { :; }"}}',
+     ['env.PS4', 'env.BASH_FUNC_cd%%'], []),
+]
+# the same names with surrounding whitespace (whether the client trims a key is UNVERIFIED)
+PROJECT_REFUSALS += [
+    (f, json.dumps({'env': {key: '/x/planted-value'}}), [f'env.{json.dumps(key)[1:-1]}'], ['/x/planted-value'])
+    for key, f in ((' BASH_ENV ', 'settings.json'), ('BASH_ENV\t', 'settings.local.json'),
+                   (' CLAUDE_CODE_SHELL', 'settings.json'), ('SHELL ', 'settings.local.json'),
+                   (' CLAUDE_CODE_SHELL_PREFIX ', 'settings.json'), ('\nCLAUDE_ENV_FILE', 'settings.local.json'),
+                   (' ps4', 'settings.json'), ('PROMPT_COMMAND ', 'settings.local.json'),
+                   (' BASH_FUNC_ls%% ', 'settings.json'), (' HOME', 'settings.local.json'),
+                   (' ANTHROPIC_BASE_URL', 'settings.json'), ('HTTPS_PROXY ', 'settings.local.json'))
+]
+PROJECT_REFUSALS += [
     ('settings.json', '{ not json', ['.claude/settings.json: cannot be read as JSON'], []),
     ('settings.local.json', '[]', ['.claude/settings.local.json: the top level is not an object'], []),
 ]
@@ -983,7 +1074,7 @@ def session_shell():
     callers = [(None, None), ('/bin/zsh', '/bin/zsh'), ('/nonexistent/sh', '/nonexistent/sh'), ('', ''),
                (None, '/bin/zsh'), ('/bin/zsh', None), ('/bin/sh', '/usr/local/bin/fish')]
     for ccs, sh in callers:
-        for mode in ((), ('--full',), ('--user-scope',)):
+        for mode in ((), ('--full',), ('--user-scope',), ('--no-guard',), ('--no-loop-guard',)):
             e = Env()
             try:
                 e.up()
@@ -1004,6 +1095,10 @@ def session_shell():
                 check(env.get('SHELL') == SESSION_SHELL, f'{label}: claude gets SHELL={env.get("SHELL")!r}')
                 check('CLAUDE_CODE_SHELL_PREFIX' not in env, f'{label}: the caller CLAUDE_CODE_SHELL_PREFIX is cleared')
                 check('CLAUDE_ENV_FILE' not in env, f'{label}: the caller CLAUDE_ENV_FILE is cleared')
+                left = sorted(k for k in env if k.startswith('BASH_FUNC_')
+                              or k in ('PS4', 'PROMPT_COMMAND', 'POSIXLY_CORRECT', 'INPUTRC', 'BASH_ENV', 'ENV',
+                                       'SHELLOPTS', 'BASHOPTS'))
+                check(not left, f'{label}: no bash start-up name or exported function reaches claude: {left}')
                 s_env = cl[0]['settings'].get('env', {})
                 check(s_env.get('CLAUDE_CODE_SHELL') == SESSION_SHELL and s_env.get('SHELL') == SESSION_SHELL,
                       f'{label}: the --settings file pins env.CLAUDE_CODE_SHELL and env.SHELL: '
@@ -1058,6 +1153,119 @@ def session_shell():
     swapped(lambda e: e.write('bin/ww-bash', '#!/bin/sh\n', 0o757), 'session shell world-writable',
             ['bash (the session shell) refused', 'writable by everyone'])
     swapped(lambda e: 'bash', 'session shell relative', ['bash (the session shell)', 'not an absolute path'])
+
+
+# Exported functions whose names are no identifier: bash 3.2 imports them only outside
+# posix mode, so these runs drop POSIXLY_CORRECT from the poison set (the posix-mode runs
+# are every other case). Name presence only.
+ODD_FUNCS = {f'BASH_FUNC_{n}%%': f'() {{ echo stand-in-{i}; }}'
+             for i, n in enumerate(('-x', '--', '-', '-f', 'a-b', 'a.b', 'ls', 'say'))}
+
+
+def exported_functions():
+    for args, server_up in ((('-p', 'x'), True), (('--start-server', '-p', 'x'), False),
+                            (('--full', '-p', 'x'), True), (('--no-guard', '-p', 'x'), True)):
+        e = Env()
+        try:
+            e.env.pop('POSIXLY_CORRECT', None)
+            e.env.update(ODD_FUNCS)
+            if server_up:
+                e.up()
+            r = e.run(*args)
+            label = f'exported functions, no posix mode, {list(args)}'
+            cl = [c for c in e.calls() if c['who'] == 'claude']
+            if not check(r.returncode == 0 and len(cl) == 1, f'{label}: launches: rc {r.returncode} {r.stderr[-300:]!r}'):
+                continue
+            left = sorted(k for k in cl[0]['env'] if k.startswith('BASH_FUNC_'))
+            check(not left, f'{label}: no BASH_FUNC_ name reaches claude: {left}')
+            check('stand-in-' not in r.stdout and 'stand-in-' not in r.stderr,
+                  f'{label}: no caller function ran in the launcher')
+            if not server_up:
+                p = os.path.join(e.t, 'state', 'serve-funcs')
+                if check(os.path.exists(p), f'{label}: serve.sh ran and recorded its functions'):
+                    with open(p) as f:
+                        funcs = f.read()
+                    check(funcs == '', f'{label}: no exported function reaches serve.sh: {funcs!r}')
+        finally:
+            e.close()
+    builtin_sweep()
+    # fail closed: with the removal swapped out in the test copy, a surviving function refuses
+    e = Env()
+    try:
+        e.env.pop('POSIXLY_CORRECT', None)
+        e.env.update(ODD_FUNCS)
+        p = os.path.join(e.repo, 'scripts', 'claude-local.sh')
+        with open(p, encoding='utf-8') as f:
+            text = f.read()
+        old = 'builtin unset -f -- "${fn#declare -f* }"'
+        if check(text.count(old) == 1, 'exported functions: the removal line is in the copy'):
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write(text.replace(old, ':'))
+            r = e.run('--start-server', '-p', 'x')
+            refused_quietly(e, r, 'exported functions: one survives the removal',
+                            ['an exported shell function survived the removal'])
+    finally:
+        e.close()
+
+
+SWEEP_TIMEOUT = 30    # one sweep run takes about a second
+
+
+def sweep_one(name):
+    """One run with one caller-exported function named name (no posix mode).
+
+    Returns (ran, r, calls, funcs): whether the function ran, the result (None when the
+    launcher did not end within SWEEP_TIMEOUT), the kinds of the recorded calls and the
+    BASH_FUNC_ names in claude's environment."""
+    e = Env()
+    try:
+        e.env.pop('POSIXLY_CORRECT', None)
+        for k in [k for k in e.env if k.startswith('BASH_FUNC_')]:
+            del e.env[k]
+        marks = os.path.join(e.t, 'state', 'function-ran')
+        e.env[f'BASH_FUNC_{name}%%'] = f"() {{ /bin/echo ran >> '{marks}'; }}"
+        e.up()
+        try:
+            r = e.run('-p', 'x', timeout=SWEEP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            r = None
+        cl = e.calls()
+        funcs = sorted(k for c in cl if c['who'] == 'claude' for k in c['env'] if k.startswith('BASH_FUNC_'))
+        return os.path.exists(marks), r, [kind(c) for c in cl], funcs
+    finally:
+        e.close()
+
+
+# The caller functions that run in the launcher, out of every builtin name: set replaces
+# the first line (set +xv) before the removal; builtin replaces every `builtin X`. The
+# launcher does not defend itself against the shell that starts it (README, Known limits);
+# this set is pinned so that a new bare command word before the removal fails here.
+SWEEP_RAN = ['builtin', 'set']
+
+
+def builtin_sweep():
+    """Every bash 3.2 builtin (plus ls, die, say) as a caller function, one per run.
+
+    Every run ends; for every name but builtin the launch succeeds and no BASH_FUNC_ name
+    reaches claude; the functions that ran are exactly SWEEP_RAN. For builtin only the
+    end of the run is checked: it defeats the removal (the documented limit)."""
+    names = subprocess.run(['/bin/bash', '-c', 'compgen -b'], env={'PATH': '/usr/bin:/bin'},
+                           capture_output=True, text=True, timeout=30).stdout.split()
+    check(len(names) > 50 and {':', 'set', 'builtin', 'break', 'exit', 'printf'} <= set(names),
+          f'sweep: compgen -b lists the builtins: {len(names)}')
+    names += ['ls', 'die', 'say']
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        results = dict(zip(names, pool.map(sweep_one, names)))
+    hung = sorted(n for n, (_, r, _, _) in results.items() if r is None)
+    check(not hung, f'sweep: every run ends within {SWEEP_TIMEOUT} s: {hung}')
+    ran = sorted(n for n, (hit, _, _, _) in results.items() if hit)
+    check(ran == SWEEP_RAN, f'sweep: the caller functions that ran are exactly {SWEEP_RAN}: {ran}')
+    for n, (hit, r, calls, funcs) in results.items():
+        if n == 'builtin' or r is None:
+            continue
+        check(r.returncode == 0 and calls[-1:] == ['claude'] and not funcs,
+              f'sweep {n}: launches, no BASH_FUNC_ name reaches claude: rc {r.returncode} '
+              f'{r.stderr[-200:]!r} {calls} {funcs}')
 
 
 FIXED_STAMP = '20260101-000000'
@@ -1300,7 +1508,8 @@ def syntax():
 def main():
     global N, FAILS
     for group in (syntax, static_order, lean_run, full_run, scope_and_guards, start_server,
-                  preflight, print_args, refusals, allow_list, max_turns, project_settings, session_shell, run_dir,
+                  preflight, print_args, refusals, allow_list, max_turns, project_settings, session_shell,
+                  exported_functions, run_dir,
                   tools, settings_rules):
         try:
             group()
