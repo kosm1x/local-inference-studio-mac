@@ -10,6 +10,7 @@ used for the auditor's `!allow` rows where either outcome is safe.
 import base64
 import contextlib
 import datetime
+import hashlib
 import importlib.util
 import io
 import json
@@ -151,7 +152,7 @@ CASES = [
     ('powershell -NoProfile -Command "Invoke-WebRequest https://example.com"', None),
     ('git commit -m "msg"', None),
     ('git config --global user.name x', None),
-    ('find . -name "*.tmp" -delete', None),
+    ('find . -name "*.tmp" -delete', 'deny'),      # W-25: a recursive delete
     ('ssh ' + REMOTE, 'deny'),   # 2026-10-30: the hook denies what the settings deny
     ('for d in /z/repos/*/; do echo $d; done', None),
     ('node -e "1"', 'deny'),
@@ -572,7 +573,7 @@ CASES = [
     ('git log --output=/tmp/x', 'deny'),   # audit A4 W1/W2
     # R8: unquoted braces/globs/tilde are expanded by bash after the hook reads the segment
     # (-{delete,delete} becomes -delete -delete) -> none; find/tree/rg are allow-lists
-    ('find D -{delete,delete}', None),
+    ('find D -{delete,delete}', 'deny'),           # W-25: find -delete, brace-expanded
     ('find ~/.claude -{delete,delete}', 'deny'),   # audit A2: credential dir / env dump / network substitution
     ('find D -{name,}', None),
     ('rg --{pre,pre}=sh p .', None),
@@ -588,8 +589,8 @@ CASES = [
     ('eval x', None),
     ('source f', None),
     ('. f', None),
-    ('find D -delete', None),
-    ('find D -exec rm {} +', None),
+    ('find D -delete', 'deny'),                    # W-25
+    ('find D -exec rm {} +', 'deny'),              # W-25
     ('find D -fprint out', None),
     ('find D -name x -execdir id', None),
     ('find -L D -name x', None),
@@ -846,7 +847,7 @@ FOLD3_CASES = [
     ("python -c \"open('scripts/ho'+'oks/lis-guard.py', 'w').write('')\"", 'deny'),
     ('sed -i s/a/b/ notes.txt', None),
     ('git checkout main', None),
-    ('git restore notes.txt', None),
+    ('git restore notes.txt', 'deny'),             # W-25: git checkout -- by another name
     ('sed -n 1,5p scripts/hooks/lis-guard.py', None),
 ]
 CASES += FOLD3_CASES
@@ -2821,7 +2822,7 @@ def w24a_container():
         ('rm -rf /tmp/build /work/x', None, 'deny'),
         ('rm -rf node_modules/llama-cpp && npm install', None, 'deny'),
         ('rm -rf node_modules/llama-cpp\nnpm install', None, 'deny'),
-        ('git restore package-lock.json', None, None),        # not a hook deny on either
+        ('git restore package-lock.json', None, 'deny'),      # W-25: an undo verb
         ('git stash', None, None),
         ('git stash pop', None, None),
         ('rm -rf /', 'deny', 'deny'),
@@ -2871,11 +2872,11 @@ def w24a_container():
         ('ps aux', None, None),
         ('ps -ef', None, None),
         ('ps -C node', None, None),
-        # audit W3: an rm option outside the set is not the (d) shape; an option before the
-        # flags gets no decision on either side (OPEN W-25)
+        # audit W3: an rm option outside the set is not the (d) shape; W-25: -i joins the
+        # set, and an option before the flags is read (a deny on both sides)
         ('rm -rf --unknown x', 'deny', 'deny'),
-        ('rm -rf -i x', 'deny', 'deny'),
-        ('rm --unknown -rf x', None, None),
+        ('rm -rf -i x', None, 'deny'),
+        ('rm --unknown -rf x', 'deny', 'deny'),
         # closer W1: the guards' state dirs are critical path parts: a delete (the W-23 reset),
         # a move away, a write or a link planted there (loop-guard off) denies; reads stay
         ('rm -rf /tmp/lis-loop-guard', 'deny', 'deny'),
@@ -3023,7 +3024,7 @@ def w24a_container():
                 if not (d and d[0] == 'deny' and 'RUN_TARGET_CAP' in d[1]):
                     fails += 1
                     print(f'FAIL W-24a cap in the container: {d}')
-                for c in ('rm -rf --unknown x', 'rm -rf -i x', 'rm -rf --no-preserve-root x'):
+                for c in ('rm -rf --unknown x', 'rm -rf -X x', 'rm -rf --no-preserve-root x'):
                     n += 1                      # audit W3: the rm option set is closed
                     with env_set(g.CONTAINER_ENV, '1'):
                         if g.container_undo(c, t) is not None:
@@ -3088,8 +3089,8 @@ def w23_escalation():
             # a different command: its own count, the first one's untouched
             p2 = dict(p, tool_input={'command': 'rm -rf build'})
             expect('other command starts at 1', reason(run_main(p2)) == g.decide('rm -rf build')[1])
-            with open(path, encoding='ascii') as f:
-                expect('two independent hashes', sorted(json.load(f)['denied'].values()) == [1, 4])
+            with open(path, encoding='ascii') as f:     # W-25: rm also bumps its path key
+                expect('independent hashes', sorted(json.load(f)['denied'].values()) == [1, 1, 4])
             # the same command in another cwd counts apart
             p3 = dict(p, cwd=t + os.sep + 'sub')
             expect('other cwd starts at 1', reason(run_main(p3)) == base)
@@ -3196,6 +3197,244 @@ def w23_escalation():
             finally:
                 g.deny_state_dir = old_dir
                 unplant_link(link)
+    return n, fails
+
+
+def w25_undo():
+    """W-25: the undo shapes of the 2026-11-10 run. In the container the literal check reads
+    each undo segment (an `echo "done"` or `git status` beside it goes to the other rules),
+    and find -delete / -exec rm, git restore and git checkout <ref> -- join rm -r/-f and git
+    checkout -- (on the host: a critical delete, the undo verb's reason). Every row runs with
+    LIS_CONTAINER=1 and unset, the unset decision being the host's. W-23 (c): an undo deny
+    also counts by its path set, so varied retries of one undo escalate. Returns (checks, fails)."""
+    n = fails = 0
+    cwd = '/work/personal-chess'
+    undo = tuple(f'lis-guard: {h} matched' for h in g.UNDO_HITS)
+
+    def expect(name, ok):
+        nonlocal n, fails
+        n += 1
+        if not ok:
+            fails += 1
+            print(f'FAIL W-25: {name}')
+    live = [  # (command, container want, host want); a container None is the undo rule's
+        'git checkout -- package-lock.json && echo "checkout done" && rm -rf node_modules/llama-cpp'
+        ' && echo "rm done" && git status --short',
+        'rm -rf node_modules/llama-cpp && echo "llama-cpp removed"',
+        'rm -r node_modules/llama-cpp && echo "removed"',
+        'find node_modules/llama-cpp -type f -delete 2>&1 && find node_modules/llama-cpp -type d'
+        ' -empty -delete 2>&1 && echo "find-delete done"',
+        'git restore package-lock.json && echo "restore done" && git status --short',
+        'rm -i -rf x', 'rm -v -rf x', 'git checkout HEAD -- a',
+        # more of the same shapes
+        'git restore --source=HEAD~1 -- a', 'git restore --staged --worktree a b',
+        'git restore -s HEAD a', 'git checkout main -- a', 'rm x -rf', 'rm -I -d -rf x',
+        'rm --interactive=never --one-file-system -rf x', 'rm -rf x 2>/dev/null && echo ok',
+        'find x -exec rm -rf {} \\;', 'find x -execdir rm {} +', 'find x y -name a -delete',
+    ]
+    neg = [  # deny on both sides
+        'rm -rf "node_modules/x" && echo done', 'rm -rf $X && echo done',
+        'git checkout -- "a b" && echo "x"', 'rm -rf x\\ y', 'cd /work/x && rm -rf y',
+        'rm -rf /work', 'rm -rf node_modules/llama-cpp && rm -rf /lis/scripts',
+        'find /home/lis/.claude -delete', 'rm --no-preserve-root -rf x',
+        'find x -delete 2>&1 > /work/log', 'find x -fprint /tmp/l -delete', 'find -delete',
+        'find x -name *.o -delete', 'find x -exec sh -c "rm -rf /" {} \\;',
+        'find x -exec rm -rf {} \\; -exec sh x {} \\;', 'cat <<EOF\nrm -rf x\nEOF',
+        'git -C /tmp restore a', 'git restore -p a', 'git checkout -f HEAD -- a',
+        'echo "rm -rf x" && rm -rf x', 'rm -rf x && echo $(rm -rf /lis)',
+        # audit round: git pathspec magic (:/ is the work-tree top), the -exec rm terminator,
+        # options before checkout's --, and a find test value naming a critical path
+        'git restore -- :/', 'git restore -- :!x', 'git checkout HEAD -- :/',
+        'find x -exec rm -rf /lis/scripts \\;', 'git checkout -f -- a', 'git checkout -b y -- a',
+        'find plain -newer ~/.claude/settings.json -delete',
+    ]
+    with session_at(0), env_set('HOME', '/home/lis'):
+        for env in ('1', None):
+            with env_set(g.CONTAINER_ENV, env):
+                for cmd in live:
+                    d = g.decide(cmd, cwd)
+                    if env:
+                        expect(f'container {cmd!r}: {d}', d is None or not d[1].startswith(undo))
+                        expect(f'container undo shape {cmd!r}', g.container_undo(cmd, cwd) is not None)
+                    else:
+                        expect(f'host {cmd!r}: {d}', d and d[0] == 'deny' and d[1].startswith(undo))
+                for cmd in neg:
+                    d = g.decide(cmd, cwd)
+                    expect(f'{g.CONTAINER_ENV}={env!r} negative {cmd!r}: {d}', d and d[0] == 'deny')
+    # the guard walk and the work-tree top, under a scratch run root
+    with tempfile.TemporaryDirectory() as t:
+        for rel in (('proj', '.git'), ('proj', 'src'), ('pkgs', 'inner', '.git'), ('pkgs', 'other'),
+                    ('scripts', 'hooks')):
+            os.makedirs(os.path.join(t, *rel))
+        old_roots = g.CONTAINER_RUN_ROOTS
+        g.CONTAINER_RUN_ROOTS = old_roots + (t,)
+        try:
+            for cmd, want in (('find pkgs -type f -delete', 'deny'), ('find proj -delete', 'deny'),
+                              ('find pkgs/other -delete && echo "done"', None),
+                              ('find proj/src -delete', None), ('git restore -- pkgs/inner', 'deny'),
+                              ('rm -rf pkgs/other && rm -rf pkgs', 'deny'),
+                              # a critical path only once resolved (the walk sees no hit below it)
+                              ('find scripts/./hooks -type f -delete && echo "done"', 'deny')):
+                for env, w in (('1', want), (None, 'deny')):
+                    with env_set(g.CONTAINER_ENV, env):
+                        d = g.decide(cmd, t)
+                    expect(f'walk {g.CONTAINER_ENV}={env!r} want={w!r} {cmd!r}: {d}', (d[0] if d else None) == w)
+            # audit round: pathspec magic from inside a work tree reaches its top (:/) or
+            # everything but a name (:!x, :^x); never an undo, on either side
+            for cmd in ('git restore -- :/', 'git restore -- :!x', 'git restore :^x',
+                        'git restore -- :/scripts', 'git restore -s HEAD :/',
+                        'git restore --source=HEAD~5 -- :/', 'git checkout HEAD -- :/',
+                        'git restore -- :!a && echo "done"'):
+                for env in ('1', None):
+                    with env_set(g.CONTAINER_ENV, env):
+                        d = g.decide(cmd, os.path.join(t, 'proj', 'src'))
+                    expect(f'pathspec {g.CONTAINER_ENV}={env!r} {cmd!r}: {d}', d and d[0] == 'deny')
+            # the work-tree top check on its own (the walk also sees a top's .git): stub it out
+            old_walk, g.guard_below = g.guard_below, lambda rp: False
+            try:
+                with env_set(g.CONTAINER_ENV, '1'):
+                    for cmd, want in (('rm -rf proj', 'deny'), ('find proj -delete', 'deny'),
+                                      ('git restore -- proj', 'deny'), ('rm -rf proj/src', None)):
+                        d = g.decide(cmd, t)
+                        expect(f'top check, walk stubbed, want={want!r} {cmd!r}: {d}',
+                               (d[0] if d else None) == want)
+            finally:
+                g.guard_below = old_walk
+        finally:
+            g.CONTAINER_RUN_ROOTS = old_roots
+
+    # W-23 (c): the path key
+    def reason(out):
+        return json.loads(out)['hookSpecificOutput']['permissionDecisionReason'] if out else None
+    old_dir = g.deny_state_dir
+    with tempfile.TemporaryDirectory() as t, env_set(g.CONTAINER_ENV, None):
+        g.deny_state_dir = lambda: t
+        try:
+            p = {'tool_name': 'Bash', 'session_id': 'w25-a', 'cwd': cwd}
+            r = [reason(run_main(dict(p, tool_input={'command': c}))) for c in (
+                'rm -rf node_modules/x && echo "a"', 'rm -r node_modules/x && echo "b"',
+                'find node_modules/x -delete')]
+            expect(f'first two plain: {r[:2]}', all(x and x.startswith(undo) and 'denied' not in x
+                                                    for x in r[:2]))
+            expect(f'third varied retry escalates: {r[2]!r}',
+                   (r[2] or '').endswith(g.REPEAT_PATHS_SUFFIX.format(3)))
+            other = reason(run_main(dict(p, tool_input={'command': 'rm -rf node_modules/y && echo "c"'})))
+            expect(f'other path set starts at 1: {other!r}', other and 'denied' not in other)
+            r4 = reason(run_main(dict(p, tool_input={'command': 'git checkout -- ./node_modules/x/'})))
+            expect(f'same path, other verb and spelling: N=4 {r4!r}',
+                   (r4 or '').endswith(g.REPEAT_PATHS_SUFFIX.format(4)))
+            two = [reason(run_main(dict(p, tool_input={'command': c}))) for c in (
+                'rm -rf node_modules/x node_modules/y', 'rm -r node_modules/y node_modules/x')]
+            expect(f'a two-path set counts apart: {two}', all(x and 'denied' not in x for x in two))
+            # the exact key still wins its own suffix; a deny with no undo paths keeps one key
+            ex = [reason(run_main(dict(p, tool_input={'command': 'rm -rf node_modules/x'}))) for _ in range(3)]
+            expect(f'exact repeat keeps the exact suffix: {ex[2]!r}',
+                   (ex[2] or '').endswith(g.REPEAT_SUFFIX.format(3)))
+            q = dict(p, session_id='w25-b')
+            pv = [reason(run_main(dict(q, tool_input={'command': c}))) for c in (
+                'git push --force origin main', 'git push -f origin main', 'git push origin +main')]
+            expect(f'no path key for a non-undo deny: {pv[2]!r}', pv[2] and 'denied' not in pv[2])
+            with open(os.path.join(t, 'w25-b.json'), encoding='ascii') as f:
+                expect('non-undo: one key per command', sorted(json.load(f)['denied'].values()) == [1, 1, 1])
+            with open(os.path.join(t, 'w25-a.json'), encoding='ascii') as f:
+                s = json.load(f)
+            key = hashlib.sha1('\0'.join(['undo', os.path.normpath(g.resolve('node_modules/x', cwd))])
+                               .encode('utf-8')).hexdigest()
+            expect(f'state shape and path key {s}', list(s) == ['denied'] and s['denied'].get(key) == 7)
+            rs = [reason(run_main(dict(p, session_id='w25-c', tool_input={'command': c}))) for c in (
+                'rm -rf $X', 'rm -r $X && echo a', 'find $X -delete')]
+            expect(f'a computed operand has no path key: {rs[2]!r}', rs[2] and 'denied' not in rs[2])
+        finally:
+            g.deny_state_dir = old_dir
+    return n, fails
+
+
+def mac_w25_bsd():
+    """macOS port, W-25: BSD find (and bfs, which Claude Code's shell runs as `find` here)
+    takes -H -L -P -E -X -d -s -x and `-f path` before the paths, and BSD rm takes -P -W -x.
+    On the host every such delete denies with the undo verb's reason, and the W-23 path key
+    (bsd_undo_toks) keys it on the same paths as the plain spelling; container_undo's shape
+    check (undo_ops) stays strict. Returns (checks, fails)."""
+    n = fails = 0
+    cwd = '/Users/x/Code/proj'
+    undo = tuple(f'lis-guard: {h} matched' for h in g.UNDO_HITS)
+
+    def expect(name, ok):
+        nonlocal n, fails
+        n += 1
+        if not ok:
+            fails += 1
+            print(f'FAIL macOS W-25: {name}')
+    deny = ['find -E . -regex ".*\\.o" -delete', 'find -E x -delete', 'find -x . -name a -delete',
+            'find -L x -delete', 'find -H x -delete', 'find -P x -delete', 'find -s x -delete',
+            'find -d x -delete', 'find -X x -delete', 'find -f x -delete', 'find -Ex . -delete',
+            'find -f x -f y -exec rm {} \\;', 'find -L -E x -type f -delete', 'find . -d -delete',
+            'find . -x -delete', 'find . -Bmin -5 -delete', 'find . -flags nodump -delete',
+            'find x -exec /bin/rm -f {} +', 'find x -ok rm {} \\;', "find x -exec rm {} ';'",
+            'find x -exec rm -P {} \\;', '/usr/bin/find x -delete', 'find models -name "*.gguf" -delete',
+            'find x -delete | tee log', 'cd /tmp; find w25x -delete',
+            'rm -P -rf x', 'rm -x -r x', 'rm -rfx x', 'rm -rfW x', 'rm a b -rf', 'rm a b c -rf',
+            'git checkout a b c -- d',
+            # the text-scan bounds the README states: 20 words before rm's flag, 3 words
+            # before checkout's --, 400 characters between `find ` and its action
+            'rm ' + ' '.join(f'a{i}' for i in range(20)) + ' -rf',
+            'find ' + 'x' * 400 + ' -delete', 'find ' + 'x' * 400 + ' -exec rm {} +']
+    keep = [('find -E . -regex ".*py"', None), ('find -x . -name a', None),
+            ('find . -name x -print0', 'allow'), ('find . -type d -empty', 'allow'),
+            ('rm -W x', None), ('rm -d x', None), ('git checkout main', None),
+            ('rm ' + ' '.join(f'a{i}' for i in range(21)) + ' -rf', None),
+            ('git checkout a b c d -- e', None), ('find ' + 'x' * 401 + ' -delete', None),
+            ('find ' + 'x' * 401 + ' -exec rm {} +', None)]
+    with session_at(0), env_set(g.CONTAINER_ENV, None):
+        for cmd in deny:
+            d = g.decide(cmd, cwd)
+            expect(f'host deny {cmd!r}: {d}', d and d[0] == 'deny' and d[1].startswith(undo))
+        for cmd, want in keep:
+            d = g.decide(cmd, cwd)
+            expect(f'keeps {want!r} {cmd!r}: {d}', (d[0] if d else None) == want)
+    x, y = (os.path.normpath(g.resolve(p, cwd)) for p in ('x', 'y'))
+    for cmd, want in (('find -E x -delete', [x]), ('find -L -E x -type f -delete', [x]),
+                      ('find -f x -delete', [x]), ('find -f x -f y -exec rm {} \\;', [x, y]),
+                      ('find -x -f x y -delete', [x, y]), ('rm -rfx x', [x]), ('rm -P -rf x', [x]),
+                      ('rm -rf -W x y', [x, y]), ('rm -rf -- -x', [os.path.normpath(g.resolve('-x', cwd))]),
+                      ('find -E x -delete && echo "done"', [x]), ('find -Q x -delete', None),
+                      ('find -E -f -delete', None), ('git restore x', [x]), ('git restore -W x', [x]),
+                      ('git restore -S -W x', [x]), ('git restore -X x', None)):
+        got = g.undo_paths(cmd, cwd)
+        expect(f'path key {cmd!r}: {got} want {want}', got == want)
+    for cmd in ('find -E x -delete', 'find -f x -delete', 'find -L x -delete', 'rm -rfx x'):
+        expect(f'container shape stays strict {cmd!r}', g.undo_ops(g.tokens(cmd)) is None)
+    expect('plain find shape', g.undo_ops(g.tokens('find x -delete')) == ['x'])
+    expect('git restore -W shares the key of git restore',
+           g.undo_paths('git restore -W x', cwd) == g.undo_paths('git restore x', cwd))
+    # the container profile (inert on macOS, carried as in the reference): git restore -W
+    # (--worktree) under /tmp is an undo there, so it gets no decision; an option outside
+    # RESTORE_OPT keeps the deny; on the host both deny
+    tcwd = '/tmp/lis-w25-restore'
+    for cmd, cwant in (('git restore -W a', None), ('git restore --worktree a', None),
+                       ('git restore -S -W a', None), ('git restore -X a', 'deny')):
+        for env, want in (('1', cwant), (None, 'deny')):
+            with session_at(0), env_set(g.CONTAINER_ENV, env):
+                d = g.decide(cmd, tcwd)
+            expect(f'{g.CONTAINER_ENV}={env!r} want={want!r} {cmd!r} in {tcwd}: {d}',
+                   (d[0] if d else None) == want)
+
+    def reason(out):
+        return json.loads(out)['hookSpecificOutput']['permissionDecisionReason'] if out else None
+    old_dir = g.deny_state_dir
+    with tempfile.TemporaryDirectory() as t, env_set(g.CONTAINER_ENV, None):
+        g.deny_state_dir = lambda: t
+        try:
+            p = {'tool_name': 'Bash', 'session_id': 'w25-mac', 'cwd': cwd}
+            r = [reason(run_main(dict(p, tool_input={'command': c}))) for c in (
+                'find -E node_modules/x -delete', 'rm -rfx node_modules/x && echo "b"',
+                'find -f node_modules/x -type f -delete')]
+            expect(f'BSD spellings: first two plain {r[:2]}',
+                   all(v and v.startswith(undo) and 'denied' not in v for v in r[:2]))
+            expect(f'BSD spellings: third escalates {r[2]!r}',
+                   (r[2] or '').endswith(g.REPEAT_PATHS_SUFFIX.format(3)))
+        finally:
+            g.deny_state_dir = old_dir
     return n, fails
 
 
@@ -4226,6 +4465,7 @@ def main():
                   'scripts/register-watchdog.ps1', 'scripts/serve.ps1', 'scripts/unregister-task.ps1',
                   'scripts/verify-claims.ps1', 'scripts/watchdog.ps1',
                   'bench/ladder/bait.py', 'bench/ladder/gen_bait.py',
+                  'bench/ladder/blocked.py',      # W-25: its docstring names git restore
                   'bench/ladder/tests/bait_test.py', 'bench/ladder/tests/blocked_test.py',
                   'bench/ladder/tests/gen_bait_test.py',
                   # operator-run: docker build of the lis-web image, and the -LisWeb test whose
@@ -4313,6 +4553,12 @@ def main():
     k, f = mac_osascript_run()
     n += k
     fails += f
+    k, f = w25_undo()
+    n += k
+    fails += f
+    k, f = mac_w25_bsd()
+    n += k
+    fails += f
     # ledger S-B3 audit C1: CRITICAL_PATH names the hook copies on its own, so a narrowed
     # any-mention rule still leaves a shell write to a copy critical
     n += 1
@@ -4394,7 +4640,7 @@ def main():
         ('date -s not allowed', lambda: g.decide('date -s "2020-01-01"') is None),
         ('docker read sub-verb list: rm not allowed', lambda: g.decide('docker inspect x') is None),
         ('docker ps allowed', lambda: g.decide('docker ps')[0] == 'allow'),
-        ('find -delete not allowed', lambda: g.decide('find . -delete') is None),
+        ('find -delete denies (W-25)', lambda: g.decide('find . -delete')[0] == 'deny'),
         ('ssh readonly required', lambda: g.decide('ssh ' + REMOTE + ' "rm x"')[0] == 'deny'),
         ('curl localhost only', lambda: g.decide('curl -s http://evil.com/') is None),
         ('git branch -D denies', lambda: g.decide('git branch -D x')[0] == 'deny'),

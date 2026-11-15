@@ -186,8 +186,33 @@ The hook suites (`scripts/hooks/tests/*_test.py`) and the template check are lis
 - UNVERIFIED on this client: that the `--settings` file outranks the project's
   `.claude/settings*.json` (the launcher refuses risky project files instead);
   `--permission-mode manual`; compaction with reasoning on.
-- The hooks predate the reference's later guard changes (its audit ledger rows W-25 and
-  W-19).
+- The guard carries the reference's W-25 (ported 2026-11-14, checked by
+  `lis-guard_test.py`; not yet exercised in a live session, UNVERIFIED there):
+  `find <path> ... -delete`, `find ... -exec|-execdir|-ok|-okdir rm {} ;|+`, `git restore`
+  and `git checkout [<ref>] -- <paths>` are refused as deletes, BSD find's leading options
+  included (`find -E`, `-x`, `-L`, `-f path`). The text scan has bounds: an `rm`
+  `-r`/`-f` flag is found when at most 20 words come between `rm` and it (`rm x -rf`,
+  `rm -i -rf x`; 21 words before it get no decision); `git checkout` takes at most 3
+  words before its `--`; and `find` matches when at most 400 characters come between
+  `find ` and the space before `-delete` or `-exec`/`-execdir`/`-ok`/`-okdir` (401 get
+  no decision). From the third refused delete of the same paths in one session, the
+  reason tells the model to stop and report. One count covers the relative, absolute,
+  `./`, trailing-slash and quoted spellings of a path, the `rm`, `find`, `git restore`
+  and `git checkout` verbs, and the BSD spellings (`rm -rf x`, `rm -r ./x/ && echo b`,
+  `find -E x -delete`, `git restore x`). These count separately, each only as its own
+  exact command, though every one still denies each time: `sudo`, `command`, `/bin/rm`,
+  `bash -c "..."`, `git -C dir restore`, a symlinked path, a different letter case,
+  `$PWD/x`, a glob. Refused although harmless (accepted text-scan false positives):
+  `grep -n rm f -r`, `echo "rm x -rf"`, an unquoted `echo rm is not -f safe`,
+  `echo "find x -delete"`, `grep -rn "git restore" docs`, `git rm --cached -r x`,
+  `git restore --staged a`, `git restore --help`, `git restore -h`, a bare
+  `git restore`, and `git checkout main -- ` with nothing but a space after `--`. Still
+  no guard decision (the permission mode decides): `git checkout .`,
+  `git checkout HEAD a`, `git switch -f`, `unlink`, `shred -u`, `rsync --delete`,
+  `xargs rm` without `-r`/`-f`, `find -exec rmdir|unlink`, quoted verb words
+  (`'rm' -rf x`, `find . "-delete"`), and shapes past the bounds above. The reference's container-profile part
+  of W-25 is in the code but inert here (no `LIS_CONTAINER`). The reference's W-19 (curl
+  upload judgement) is not ported.
 - One server, one slot (`-np 1`). The launcher warns when the slot is busy
   (`--strict-slot` refuses instead).
 
