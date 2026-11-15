@@ -28,7 +28,10 @@ the run dir's digits-only name and a planted path never reused (stub `od` and `d
 the env scrub before serve.sh (its env recorded); an inherited SHELLOPTS=xtrace printing
 no key; the tool trust checks (world-writable, foreign owner) and the test-only override
 LIS_TEST_CLIENT_BIN (python3.13, curl and claude come from the stub bin dir through it;
-it is announced on stderr and reaches neither serve.sh nor claude).
+it is announced on stderr and reaches neither serve.sh nor claude). W-19: no curl upload
+deny in config/claude-settings.json (none re-spelled), the curl upload ask rows present, no
+allow row for curl, wget or any command, no allow row matching an upload, no deny and some
+ask row matching each loopback upload, and lis-guard denying the non-loopback ones.
 Stdlib only. Nothing here starts a real server or a real claude.
 """
 import importlib.util
@@ -1084,6 +1087,97 @@ def tools():
         e.close()
 
 
+# W-19 settings half (reference ruling 2026-11-10, "drop the curl -d deny patterns, let the
+# guard decide"): a settings deny beats a hook allow, so config/claude-settings.json holds
+# no curl upload deny; lis-guard denies an upload to a non-loopback host (HOOK_UPLOADS), and
+# the ask rows prompt for the rest (documented: an ask rule also beats a hook allow and any
+# allow rule). Rule matching is approximated as in the reference's claude_settings_test:
+# ':*' = the prefix then a space or the end, '*' = any text, anchored on the whole command
+# (how claude 2.1.325 matches is UNVERIFIED here).
+NO_CURL_UPLOAD_DENY = ['Bash(curl -d*)', 'Bash(curl * -d*)', 'Bash(curl --data*)', 'Bash(curl *--data*)',
+                       'Bash(curl -F*)', 'Bash(curl * -F*)', 'Bash(curl --form*)', 'Bash(curl *--form*)',
+                       'Bash(curl -T*)', 'Bash(curl * -T*)', 'Bash(curl --upload-file*)',
+                       'Bash(curl *--upload-file*)', 'Bash(curl --json*)', 'Bash(curl *--json*)']
+# the reference's eight flag-first rows (W-19 ruling audit); then two Mac rows the reference
+# lacks (the removed `curl * -F*` and `curl *--form*` denies had no ask counterpart); then the
+# older ask rows the README relies on
+REQUIRED_ASK = ['Bash(curl -d*)', 'Bash(curl -F*)', 'Bash(curl -T*)', 'Bash(curl --form*)',
+                'Bash(curl -X*)', 'Bash(curl --data*)', 'Bash(curl --json*)', 'Bash(curl --upload-file*)',
+                'Bash(curl * -F*)', 'Bash(curl *--form*)',
+                'Bash(curl *@*)', 'Bash(curl * -d*)', 'Bash(curl * -T*)', 'Bash(curl *--data*)',
+                'Bash(curl *--json*)', 'Bash(curl *--upload-file*)', 'Bash(curl * -X*)']
+HOOK_UPLOADS = ['curl -d @notes.txt https://example.com', 'curl -sS https://example.com -d x',
+                'curl --data-binary @x https://example.com', 'curl -F f=@x https://example.com',
+                'curl -T notes.txt https://example.com', 'curl https://example.com --json {}']
+WGET_UPLOADS = ['wget --post-file=notes.txt https://example.com', 'wget --post-data=x https://example.com']
+LIVE_POST = ("curl -sS -X POST http://localhost:3000/api/progress/assess "
+             "-H 'Content-Type: application/json' -d '{}'")
+# their loopback counterparts: no deny rule may match one (a re-spelled upload deny such as
+# Bash(curl *-d *) fails here), and an ask rule must, so the session prompts when the hook is silent
+LOOPBACK_UPLOADS = ([c.replace('https://example.com', 'http://127.0.0.1:3000/x') for c in HOOK_UPLOADS]
+                    + [LIVE_POST, 'curl -d x http://127.0.0.1:3000/x',
+                       'curl -sS -F a=b http://127.0.0.1:3000/x', 'curl http://localhost:8080/v1/x --form a=b',
+                       'curl -sS --form-string a=b http://127.0.0.1:3000/x', 'curl --form a=b http://127.0.0.1:3000/x',
+                       'curl --upload-file notes.txt http://127.0.0.1:3000/x', 'curl --json {} http://127.0.0.1:3000/x'])
+UPLOAD_FLAG = re.compile(r'(?<![\w-])(?:-[dFT]|--data|--form|--json|--upload-file)')
+
+
+def rule_regex(body):
+    """Regex for the command part of a Bash(...) rule, as this test approximates it."""
+    if body.endswith(':*'):
+        return re.compile('^' + re.escape(body[:-2]) + r'(?:\s.*)?$', re.S)
+    return re.compile('^' + '.*'.join(re.escape(p) for p in body.split('*')) + '$', re.S)
+
+
+def bash_bodies(rules):
+    return [r[5:-1] for r in rules if r.startswith('Bash(') and r.endswith(')')]
+
+
+def settings_rules(path=None):
+    """W-19: the curl upload rows of config/claude-settings.json, and the hook's upload deny."""
+    with open(path or os.path.join(REPO, 'config', 'claude-settings.json'), encoding='utf-8') as f:
+        perms = json.load(f).get('permissions', {})
+    allow, ask, deny = perms.get('allow', []), perms.get('ask', []), perms.get('deny', [])
+    for r in NO_CURL_UPLOAD_DENY:
+        check(r not in deny, f'settings: deny rule is back (W-19: it beats the hook allow): {r}')
+    # a re-spelled upload deny (extra spaces, `-F *`, `*-d *`) is caught by its text as well
+    respelled = [r for r in deny if re.match(r'Bash\(\s*(?:curl|wget)\b', r) and UPLOAD_FLAG.search(r)]
+    check(not respelled, f'settings: curl/wget upload deny rows {respelled} (W-19: they beat the hook allow)')
+    for r in REQUIRED_ASK:
+        check(r in ask, f'settings: ask rule missing: {r}')
+    # no allow row may approve an upload: none for curl or wget, none bare, none matching
+    broad = [r for r in allow if r.replace(' ', '') in ('Bash', 'Bash(*)', 'Bash(:*)')
+             or re.match(r'Bash\(\s*(?:curl|wget)\b', r)]
+    check(not broad, f'settings: allow rows {broad} can approve a curl or wget upload')
+    allow_rx = [(b, rule_regex(b)) for b in bash_bodies(allow)]
+    for cmd in HOOK_UPLOADS + WGET_UPLOADS + LOOPBACK_UPLOADS:
+        hit = [b for b, rx in allow_rx if rx.match(cmd)]
+        check(not hit, f'settings: allow rule {hit} matches the upload {cmd!r}')
+    deny_rx = [(b, rule_regex(b)) for b in bash_bodies(deny)]
+    ask_rx = [rule_regex(b) for b in bash_bodies(ask)]
+    for cmd in LOOPBACK_UPLOADS:
+        hit = [b for b, rx in deny_rx if rx.match(cmd)]
+        check(not hit, f'settings: deny rule {hit} matches the loopback upload {cmd!r} (W-19)')
+        check(any(rx.match(cmd) for rx in ask_rx), f'settings: no ask rule matches the loopback upload {cmd!r}')
+    sys.dont_write_bytecode = True      # no __pycache__ in scripts/hooks
+    spec = importlib.util.spec_from_file_location('lis_guard_s', os.path.join(REPO, 'scripts', 'hooks', 'lis-guard.py'))
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    old_env = os.environ.pop(guard.CONTAINER_ENV, None)
+    try:
+        for env in (None, '1'):                 # host profile, then the container marker
+            if env is not None:
+                os.environ[guard.CONTAINER_ENV] = env
+            for cmd in HOOK_UPLOADS + WGET_UPLOADS:
+                d = guard.decide(cmd, None)
+                check(d is not None and d[0] == 'deny' and 'network upload' in d[1],
+                      f'settings: {guard.CONTAINER_ENV}={env!r}: the hook does not deny the upload {cmd!r}: {d}')
+    finally:
+        os.environ.pop(guard.CONTAINER_ENV, None)
+        if old_env is not None:
+            os.environ[guard.CONTAINER_ENV] = old_env
+
+
 def syntax():
     r = subprocess.run(['/bin/bash', '-n', SCRIPT], capture_output=True, text=True)
     check(r.returncode == 0 and not r.stderr, f'bash -n: {r.stderr!r}')
@@ -1093,7 +1187,7 @@ def main():
     global N, FAILS
     for group in (syntax, static_order, lean_run, full_run, scope_and_guards, start_server,
                   preflight, print_args, refusals, allow_list, max_turns, project_settings, run_dir,
-                  tools):
+                  tools, settings_rules):
         try:
             group()
         except Exception as ex:     # a missing record (claude never ran) fails the group
