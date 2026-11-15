@@ -23,8 +23,8 @@ root unless a step says otherwise. Anything not done here is marked UNVERIFIED.
 
 ## 1. The repo
 
-The repo is local only (no remote). Copy it, or `git clone` an existing local checkout,
-to a directory you own. Below, `<repo>` stands for that path. Nothing in it needs root.
+The repo lives in a private GitHub repository. `git clone` it with an account that has
+access, or copy or clone an existing local checkout, to a directory you own. Below, `<repo>` stands for that path. Nothing in it needs root.
 
 ## 2. llama.cpp and Python (Homebrew)
 

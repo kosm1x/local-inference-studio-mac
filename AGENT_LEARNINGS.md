@@ -12,7 +12,7 @@
 - macOS ships bash 3.2 and BSD tools: no `timeout`, no GNU `sed`/`stat`/`date` extensions, no associative arrays.
 - macOS `ps -o comm=` follows argv[0]; it is a name check, not an identity check.
 - `/tmp` and `/var` are system links to `/private/...`; a real-path check must accept exactly those and nothing planted.
-- Every added line passes the identity grep before commit (no user name, home path, host name, session URL). This repo is local only until the operator says otherwise.
+- Every added line passes the identity grep before commit (no user name, home path, host name, session URL). Since 2026-11-15 the repo has a private GitHub remote: the grep now runs over the tracked files and every commit message before a push as well.
 - Kill rules: one validated numeric pid, quoted, TERM. Never a group, a broadcast, a pattern or a computed list. Signal and trap tests run in a throwaway container, not on the host.
 - Run ALL the test files listed in CLAUDE.md, stdin from /dev/null, before every commit; a new file under `scripts/` changes lis-guard's tables, and an open stdin hangs `lis-guard_test.py`.
 - Before telling the operator what a rule, a row or a run did: open the file, the saved log or the client documentation. Say "probe" for an unlogged run and "documented, UNVERIFIED" for client behaviour not seen live. (Wrong claims on 2026-11-14 and 2026-11-15: 20/20, "identical message", the `@` row, hook-allow precedence, "ask beats allow" on an invalid control.)

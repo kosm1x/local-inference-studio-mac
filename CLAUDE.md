@@ -37,7 +37,9 @@ the reference checkout, where present, is read-only).
 
 ## Git
 
-- The repo is local only: no remote, no push, until the owner says otherwise.
+- The repo has one remote, `origin`, a private GitHub repository (the owner's decision of
+  2026-11-15; it was local only before). Push only when the owner asks, never force-push,
+  and do not change its visibility or add another remote.
 - Commit only when asked. Messages say why. They end with a `Co-Authored-By:` trailer
   and carry no session URL.
 - No user names, home paths (write `~/...` or repo-relative paths), host names, email
