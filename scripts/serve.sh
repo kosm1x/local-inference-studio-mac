@@ -77,9 +77,10 @@ set +xv  # first: an inherited SHELLOPTS=xtrace/verbose would print the API key 
 #                          real path of the program run), for tests whose stand-in
 #                          process runs another executable (a script's interpreter).
 #
-# UNVERIFIED on this machine (no model file exists yet): a real llama-server start with
-# these flags and a model, and a clean exit on SIGTERM after the model has loaded (a
-# SIGTERM during the load did end it, measured 2026-11-10).
+# Measured on this machine 2026-11-14: a real llama-server start with these flags and
+# each manifest model, and an exit on SIGTERM (scripts/stop.sh) after the model had
+# loaded (the server log shows "cleaning up before exit"). A SIGTERM during the load
+# also ends it (measured 2026-11-10).
 set -u
 umask 077
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
@@ -729,8 +730,8 @@ case $REASONING in off|on|auto) ;; *) die "internal: reasoning value '$REASONING
 # cache, prevents network access"; it takes no value and has no --no-offline. Measured
 # 2026-11-10: `llama-server --offline --version` parses, and `--offline -m <local file>`
 # went on to "load_model: loading model" (a FIFO standing in for the model, stopped with
-# SIGTERM during the load). A full load and serve of a real model with --offline is
-# UNVERIFIED until a model exists.
+# SIGTERM during the load). A full load and serve with --offline was measured
+# 2026-11-14: both models/manifest.json entries loaded and served (bench runs).
 CMD=("$LLAMA"
     --offline
     -m "$MODEL"

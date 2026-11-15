@@ -74,6 +74,11 @@ Model payloads (`*.gguf` and anything else under here except this file and
   no leading `/`, no `..`, `.` or empty component, not a symlink, physically inside
   `config/` (no symlinked directory leading out), and the file must exist. A set
   `CHAT_TEMPLATE` is still checked when this field replaces it.
+  Claude Code needs a template that accepts system messages after the first one
+  (llama-server sends its turns as `[system, user, system, ...]`; a template that raises
+  on them makes every turn an HTTP 500). Both shipped entries carry such a template
+  (`config/chat-templates/`, each with a header saying what was patched). For a new model,
+  start the server on it and run `python3.13 -I scripts/tests/chat_template_check.py`.
 - `sampling`: an object with any of `temp` (number >= 0), `top_p` (number from 0 to 1)
   and `top_k` (integer >= 0). Each key given replaces that default (0.6, 0.95, 20); a
   key left out keeps its default. Numbers only: strings, booleans, `NaN` and
@@ -119,5 +124,5 @@ the flag.
   sampling, chat template, `--offline`). Sampling and KV type come from `sampling` and
   `kv_type`.
 - `serve.sh` always passes `--offline` (this build's `--help`: "prevents network
-  access"); the model is a local file from this manifest, so nothing is fetched. A full
-  model load with `--offline` is UNVERIFIED until a model exists.
+  access"); the model is a local file from this manifest, so nothing is fetched. Both
+  manifest models loaded and served with `--offline` on 2026-11-14 (bench runs).
