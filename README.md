@@ -211,8 +211,44 @@ The hook suites (`scripts/hooks/tests/*_test.py`) and the template check are lis
   `git checkout HEAD a`, `git switch -f`, `unlink`, `shred -u`, `rsync --delete`,
   `xargs rm` without `-r`/`-f`, `find -exec rmdir|unlink`, quoted verb words
   (`'rm' -rf x`, `find . "-delete"`), and shapes past the bounds above. The reference's container-profile part
-  of W-25 is in the code but inert here (no `LIS_CONTAINER`). The reference's W-19 (curl
-  upload judgement) is not ported.
+  of W-25 is in the code but inert here (no `LIS_CONTAINER`).
+- The reference's W-19 (curl upload judgement) is ported in its hook half only. A curl
+  upload (`-d`, `-F`, `-T`, `--data*`, `--form*`, `--json`, `--upload-file`) is loopback-only
+  when no route option is present (`--url`, `--proxy*`, `-x`, `--preproxy`, `--connect-to`,
+  `--resolve`, `--socks*`, `--noproxy`, an `--expand-` form of one; Mac additions from
+  curl 8.7.1's `--help all`: `-K`/`--config`, `--alt-svc`, `--doh-url`, `--dns-servers`, and
+  a strict prefix of any route name, since a curl that takes abbreviations reads it as one,
+  UNVERIFIED for this curl) and every target word is a loopback URL or a bare
+  `localhost`/`127.0.0.1`/`[::1]`; option values and redirections are skipped, the word
+  after `-:` counts, a quoted `<` or `>` word is a target. Words in front of the tool are
+  read through, so the upload behind them is judged: assignments, `command`, `env`,
+  `exec`, `nohup`, `time`, `nice`, `timeout` with their options, then `busybox`, `sudo` or
+  `doas` (the last two a Mac addition, with sudo's options), chained up to 6 levels
+  (`env sudo nice curl` is read; after `busybox` the next word must be the tool itself,
+  so `busybox env curl` is not). An upload is denied when one of these is assigned
+  before curl or wget: an `http_proxy`, `https_proxy`, `all_proxy`, `ftp_proxy` or
+  `socks*_proxy` variable, any case (not `no_proxy` or other names such as
+  `gopher_proxy`); as Mac additions, a `CURL_HOME`, `XDG_CONFIG_HOME` or `HOME` before
+  curl; and a target whose host the shell or a URL glob can still rewrite
+  (`http://localhost:$P/`, a `*` or `?` before the first `/`,
+  `http://localhost:3000{/,@evil.com}`). The `?` rule also refuses a quoted
+  `'http://localhost:3000?q=1'` (an accepted false positive). wget uploads deny on
+  `-e`/`--execute` or a non-loopback IPv4, `[IPv6]` or host:port word. Mac addition: a
+  `-H`/`--header` value that starts with `@` (curl reads that file and sends its lines as
+  headers) is never allowed by the read-only curl rule and counts as an upload, so, like
+  `-d @file`, it gets no decision to a loopback host and is denied to any other host
+  (`--proxy-header @file` denies as a route option); a header that merely contains `@`
+  keeps its allow. Residuals, as in the reference: a proxy set outside the command (the
+  environment, `~/.curlrc`, a wgetrc), wget bare single-label words, and bundled forms
+  such as `curl -sd`, which the settings rows do not match; also no decision (never allow)
+  for `-L`/`--location*`, `--unix-socket`, wget `-i`/`--config`, and the wrappers the hook
+  does not read through: `env -S "..."`, `xargs`, `eval`, `builtin`, `stdbuf`,
+  `caffeinate`, `arch`, `script`, and `sudo -iu`/`-Eu` (a value letter at the end of a
+  bundle). A loopback upload the container profile allows is allowed whatever the
+  loopback server does with the body next (a forwarding or relaying server). The
+  settings half is not ported: the pinned settings still deny curl uploads outright, so
+  a hook allow for a loopback upload (container profile only) has no effect yet. Not
+  exercised in a live session (UNVERIFIED).
 - The guard reads a script or patch file only when it is a regular file. A FIFO, a
   device (`/dev/stdin`, `/dev/tty`), a socket or a directory is never read, so the hook
   cannot block on one: before 2026-11-14 it could (and `lis-guard_test.py` hung when run

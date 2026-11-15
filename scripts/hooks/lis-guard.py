@@ -1001,14 +1001,21 @@ def heredocs(cmd, cap=32):
 
 def curl_uploads(a):
     """True when curl sends a body or a file: -d/-F/-T (bundled too), --data*, --form*,
-    --json, --upload-file."""
-    for t in a:
+    --json, --upload-file. macOS port: also a -H/--header/--proxy-header value that starts
+    with @ (curl 8.7.1 `<header/@file>`: the file's lines are sent as headers)."""
+    for j, t in enumerate(a):
+        nxt = a[j + 1] if j + 1 < len(a) else ''
         if t.startswith('--'):
-            if t.split('=', 1)[0].startswith(('--data', '--form', '--json', '--upload-file')):
+            name, eq, val = t.partition('=')
+            if name.startswith(('--data', '--form', '--json', '--upload-file')):
+                return True
+            if name in ('--header', '--proxy-header') and (val if eq else nxt).startswith('@'):
                 return True
         elif t.startswith('-') and len(t) > 1:
-            for ch in t[1:]:
+            for k, ch in enumerate(t[1:], 2):
                 if ch in 'dFT':
+                    return True
+                if ch == 'H' and (t[k:] or nxt).startswith('@'):
                     return True
                 if ch not in _CURL_BOOL:
                     break
@@ -1027,11 +1034,181 @@ def wget_uploads(a):
     return False
 
 
+# W-19 audit: options that send a curl request somewhere other than its URL words, matched
+# as a prefix of the long name (--proxy covers --proxy1.0 and --proxy-*)
+_CURL_ROUTE = ('--url', '--proxy', '--preproxy', '--connect-to', '--resolve', '--socks4',
+               '--socks5', '--noproxy',
+               # macOS port: a config file (-K, also in a bundle) can set url, proxy or next;
+               # an alt-svc cache can name another host; a DNS or DoH server picks where a
+               # name resolves (curl 8.7.1 --help all on the Mac)
+               '--config', '--alt-svc', '--doh-url', '--dns-servers')
+# curl long options that take the next word as their value (exact names; --expand-* too).
+# Any other long option is read as a flag, so the word after it counts as a URL (deny side)
+_CURL_VALUED_LONG = frozenset((
+    '--abstract-unix-socket', '--alt-svc', '--aws-sigv4', '--cacert', '--capath', '--cert',
+    '--cert-type', '--ciphers', '--config', '--connect-timeout', '--continue-at', '--cookie',
+    '--cookie-jar', '--create-file-mode', '--crlfile', '--curves', '--data', '--data-ascii',
+    '--data-binary', '--data-raw', '--data-urlencode', '--delegation', '--dns-interface',
+    '--dns-ipv4-addr', '--dns-ipv6-addr', '--dns-servers', '--doh-url', '--dump-header',
+    '--ech', '--egd-file', '--engine', '--etag-compare', '--etag-save', '--expect100-timeout',
+    '--form', '--form-string', '--ftp-account', '--ftp-alternative-to-user', '--ftp-method',
+    '--ftp-port', '--ftp-ssl-ccc-mode', '--happy-eyeballs-timeout-ms', '--header',
+    '--hostpubmd5', '--hostpubsha256', '--hsts', '--interface', '--ip-tos', '--ipfs-gateway',
+    '--json', '--keepalive-cnt', '--keepalive-time', '--key', '--key-type', '--knownhosts',
+    '--krb', '--libcurl', '--limit-rate', '--local-port', '--login-options', '--mail-auth',
+    '--mail-from', '--mail-rcpt', '--max-filesize', '--max-redirs', '--max-time',
+    '--netrc-file', '--oauth2-bearer', '--output', '--output-dir', '--parallel-max', '--pass',
+    '--pinnedpubkey', '--proto', '--proto-default', '--proto-redir', '--pubkey', '--quote',
+    '--random-file', '--range', '--rate', '--referer', '--request', '--request-target',
+    '--retry', '--retry-delay', '--retry-max-time', '--sasl-authzid', '--service-name',
+    '--sigalgs', '--speed-limit', '--speed-time', '--stderr', '--telnet-option',
+    '--tftp-blksize', '--time-cond', '--tls-max', '--tls13-ciphers', '--tlsauthtype',
+    '--tlspassword', '--tlsuser', '--trace', '--trace-ascii', '--trace-config',
+    '--unix-socket', '--upload-file', '--user', '--user-agent', '--variable',
+    '--vlan-priority', '--write-out'))
+# a bare IPv4, a bracketed IPv6 or host:port word, which curl takes as a URL (wget_local)
+_HOSTISH = re.compile(r'^(?:(\d{1,3}(?:\.\d{1,3}){3})|\[([0-9a-fA-F:.]*)\]|([\w.-]+):\d+)'
+                      r'(?::\d+)?(?:[/?#]|$)')
+# the bare words curl reads as a loopback URL: localhost, 127.0.0.1 or [::1], port, path
+_BARE_LOOPBACK = re.compile(r'(?i)^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:[/?#].*)?$', re.S)
+
+
+def _curl_route_name(name):
+    """macOS port: a long option name that is a route option, or a strict prefix of one
+    (--prox, --ur=, --resol): curl versions that take an unambiguous abbreviation would
+    read it as the route option (UNVERIFIED for the Mac's curl 8.7.1; deny direction)."""
+    name = re.sub(r'^--expand-', '--', name)        # --expand-url too
+    return name.startswith(_CURL_ROUTE) or any(r.startswith(name) for r in _CURL_ROUTE)
+
+
+def _host_expands(t):
+    """macOS port: True when the shell or curl's URL glob can still rewrite a target word's
+    host: a $, `, * or ? before the first / (a variable or a file-name glob can put
+    3000@evil.com after localhost:), or a { } [ ] glob (other than a leading [IPv6]) in a
+    word that holds an @ or a backslash anywhere (http://localhost:3000{/,@evil.com})."""
+    head = re.sub(r'^[a-zA-Z][\w+.-]*://', '', t).split('/', 1)[0]
+    if re.search(r'[$`*?]', head):
+        return True
+    rest = re.sub(r'^(?:[a-zA-Z][\w+.-]*://)?\[[0-9a-fA-F:.]*\]', '', t)
+    return bool(re.search(r'[{}\[\]]', rest) and re.search(r'[@\\]', t))
+
+
+def curl_local(args):
+    """loopback_only for a curl upload, read in the deny direction (W-19 audit): False when
+    a route option is present (space, = or a -x in a short bundle), or when any word that is
+    not an option or a valued option's value is other than a scheme URL with a loopback host
+    or a bare localhost / 127.0.0.1 / [::1] (with a port or path): curl sends the body to
+    every such word as a URL (evilhost, evil.com., 167772161, 0x0a000001, user@evil.com,
+    $EVIL). `-:` (--next) takes no value; after `--` every word is a URL. macOS port: the
+    route list also holds --config/-K, --alt-svc, --doh-url and --dns-servers, a strict
+    prefix of a route name counts as one, and a target whose host the shell or a URL glob
+    can still rewrite is not loopback (_host_expands)."""
+    if not loopback_only(args):
+        return False
+    skip, opts = False, True
+    for t in args:
+        if skip:
+            skip = False
+            continue
+        if opts and t == '--':
+            opts = False
+            continue
+        if m := re.match(r'\d*(?:&>>?|>>?|<)&?', t):  # a shell redirection, not a curl word
+            skip = m.end() == len(t)                 # `> out`: the target is the next word
+            continue
+        if opts and t.startswith('--'):
+            name = t.split('=', 1)[0]
+            if _curl_route_name(name):
+                return False
+            skip = '=' not in t and (name in _CURL_VALUED_LONG or name.startswith('--expand-'))
+            continue
+        if opts and t.startswith('-') and len(t) > 1:
+            for k, ch in enumerate(t[1:], 2):
+                if ch in 'xK':                  # macOS port: -K (config file) too
+                    return False
+                if ch not in _CURL_BOOL and ch != ':':
+                    skip = k > len(t) - 1       # the value is the next word
+                    break
+            continue
+        if not (_url_host(t) in LOOPBACK or _BARE_LOOPBACK.match(t)) or _host_expands(t):
+            return False
+    return True
+
+
+def wget_local(args):
+    """loopback_only for a wget upload, deny direction (W-19 audit): no -e/--execute (it can
+    set a proxy, also in a short bundle) and no non-loopback IPv4, [IPv6] or host:port word."""
+    for t in args:
+        if t.startswith('--execute') or (re.match(r'-[^-]', t) and 'e' in t):
+            return False
+        m = _HOSTISH.match(t)
+        if m and next(h for h in m.groups() if h is not None).lower() not in LOOPBACK:
+            return False
+    return loopback_only(args)
+
+
+_PROXY_ENV = re.compile(r'(?i)^(?:https?|all|ftp|socks\w*)_proxy=')
+# macOS port: an assignment that moves the .curlrc curl reads (it can set proxy or url)
+_CURLRC_ENV = re.compile(r'^(?:CURL_HOME|XDG_CONFIG_HOME|HOME)=')
+
+
+def _quote_redirs(seg):
+    """seg with each quoted or backslash-escaped < or > replaced by \\x01: shlex strips the
+    quotes, so '<' and an unquoted < (a redirection) are the same token after it."""
+    out, q, esc = [], None, False
+    for c in seg:
+        hide = esc or q is not None
+        if esc:
+            esc = False
+        elif c == '\\' and q != "'":
+            esc = True
+        elif q is None and c in '\'"':
+            q = c
+        elif c == q:
+            q = None
+        out.append('\x01' if hide and c in '<>' else c)
+    return ''.join(out)
+
+
+def seg_upload(toks, seg=None):
+    """upload_hit for a segment as typed (W-19 audit): env, command, exec, nohup, time, nice,
+    timeout and busybox words are read through, and a proxy variable assigned before a
+    curl or wget upload sends the body to that proxy, so it is not loopback. With seg, a
+    quoted < or > word reaches curl_local as \\x01, a target, not a redirection. macOS port:
+    sudo and doas (with their options) are read through as well, and a CURL_HOME,
+    XDG_CONFIG_HOME or HOME assignment before a curl upload moves the .curlrc it reads."""
+    if seg is not None and (mt := tokens(_quote_redirs(seg))) and len(mt) == len(toks):
+        toks = mt
+    rt = unwrap(strip_env(toks, False) or [])
+    for _ in range(MAX_DEPTH):
+        w = exe(rt[0]) if rt else ''
+        if w == 'busybox':
+            rt = rt[1:]
+        elif w in ('sudo', 'doas'):         # macOS port: sudo/doas and their options too
+            k = 1
+            while k < len(rt) and rt[k].startswith('-'):
+                k += 2 if rt[k] in ('-u', '-g', '-C', '-D', '-h', '-p', '-r', '-R', '-t', '-U', '-T',
+                                    '--user', '--group') else 1
+            rt = unwrap(strip_env(rt[k:], False) or [])
+        else:
+            break
+    if not rt:
+        return None
+    v = exe(rt[0])
+    pre = toks[:len(toks) - len(rt)]
+    if any(_PROXY_ENV.match(t) for t in pre) and (
+            (v == 'curl' and curl_uploads(rt[1:])) or (v == 'wget' and wget_uploads(rt[1:]))):
+        return 'network upload to a non-loopback host'
+    if v == 'curl' and any(_CURLRC_ENV.match(t) for t in pre) and curl_uploads(rt[1:]):
+        return 'network upload to a non-loopback host'      # macOS port: a moved .curlrc
+    return upload_hit(v, rt[1:])
+
+
 def upload_hit(v, args):
     """Deny reason for a network upload or copy tool in one tokenised segment."""
-    if v == 'curl' and curl_uploads(args) and not loopback_only(args):
+    if v == 'curl' and curl_uploads(args) and not curl_local(args):
         return 'network upload to a non-loopback host'
-    if v == 'wget' and wget_uploads(args) and not loopback_only(args):
+    if v == 'wget' and wget_uploads(args) and not wget_local(args):
         return 'network upload to a non-loopback host'
     if v in NET_TOOLS:
         return f'{v} (network copy or raw socket)'
@@ -1838,6 +2015,7 @@ def critical(cmd, ctx0='local', _alt=False):
         toks = tokens(seg)
         if not toks:
             continue
+        typed = toks
         toks = strip_env(toks, False) or toks
         v = exe(toks[0])
         args = toks[1:]
@@ -1866,7 +2044,7 @@ def critical(cmd, ctx0='local', _alt=False):
                 return f'{v} into a critical path'
         if v == 'curl' and (why := _curl_target_critical(args)):
             return why
-        if why := upload_hit(v, args):
+        if why := seg_upload(typed, seg):
             return why
         if v == 'nvidia-smi' and any((f in ('-f', '--filename') and j + 1 < len(args) and CRITICAL_PATH.search(args[j + 1]))
                                      or (f.startswith('--filename=') and CRITICAL_PATH.search(f))
@@ -2168,8 +2346,10 @@ def _url_host(u):
 def curl_ok(args):
     """Allow only safe options and a URL whose host is exactly 127.0.0.1/localhost (C2).
     -w / --write-out in any form is never allowed: its format can write a file
-    (%output{FILE}), and bash can build that format after the hook reads it."""
-    skip = expect_get = False
+    (%output{FILE}), and bash can build that format after the hook reads it. macOS port: a
+    -H/--header value that starts with @ reads a file and sends its lines as headers
+    (curl 8.7.1 `-H, --header <header/@file>`), so it is never allowed either."""
+    skip = expect_get = hdr = False
     url_seen = False
     for t in args:
         if skip:
@@ -2178,6 +2358,8 @@ def curl_ok(args):
                 expect_get = False
                 if t.upper() != 'GET':
                     return False
+            if hdr and t.startswith('@'):
+                return False                # macOS port: -H @file uploads the file
             continue
         if t in ('-s', '-S', '-f', '-L', '-I', '-i', '--silent', '--fail', '--location', '--head',
                  '--show-error', '--fail-with-body'):
@@ -2185,10 +2367,12 @@ def curl_ok(args):
         if re.fullmatch(r'-[sSfLIi]+', t):
             continue
         if t in ('-X', '--request'):
-            skip = expect_get = True; continue
+            skip = expect_get = True; hdr = False; continue
         if t in ('-H', '--header', '-m', '--max-time', '--connect-timeout',
                  '-A', '--user-agent'):
-            skip = True; continue
+            skip, hdr = True, t in ('-H', '--header'); continue
+        if t.startswith('--header=@'):
+            return False                    # macOS port: --header=@file
         if t.startswith(('--max-time=', '--connect-timeout=', '--header=', '--user-agent=')):
             continue
         if t.startswith('-X'):
