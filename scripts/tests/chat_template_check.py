@@ -2,9 +2,9 @@
 
 Run from the repo root, with the server up (scripts/serve.sh --detach --wait 300):
 
-    python3.13 -I scripts/tests/chat_template_check.py [--port N]
-    python3.13 -I scripts/tests/chat_template_check.py --save-baseline FILE
-    python3.13 -I scripts/tests/chat_template_check.py --baseline FILE
+    /opt/homebrew/bin/python3.13 -I scripts/tests/chat_template_check.py [--port N]
+    /opt/homebrew/bin/python3.13 -I scripts/tests/chat_template_check.py --save-baseline FILE
+    /opt/homebrew/bin/python3.13 -I scripts/tests/chat_template_check.py --baseline FILE
 
 Claude Code sends conversations that llama-server turns into [system, user, system, ...]
 (the later system messages carry hook and reminder text). A template that raises on a
@@ -41,21 +41,26 @@ chat_template: anything else is reported as a failure (with --save-baseline noth
 written, since the template being saved could not be identified). Exit status 0 = all
 checks passed.
 
-No proxy is ever used: every request goes through OPENER, built with an empty
-ProxyHandler, so http_proxy / HTTP_PROXY / all_proxy in the environment (which -I does not
-clear) cannot route the request, and its Authorization header, to a proxy host. A reply
-that is not UTF-8, or a 200 from /apply-template that is not a JSON object with a string
-"prompt", is a counted FAIL for that case. The --save-baseline FILE's directory must exist
-and be writable (bench/results/ is gitignored, so on a fresh clone: mkdir -p bench/results);
-otherwise the run stops with one FAIL line before anything is rendered.
+No proxy is ever used: every request goes through OPENER (make_opener()), built with an
+empty ProxyHandler, so neither http_proxy / HTTP_PROXY in the environment (which -I does
+not clear) nor, on macOS, the system proxy settings (which urllib's getproxies() reads) can
+route the request, and its Authorization header, to a proxy host. No redirect is ever
+followed either (urllib would copy the Authorization header to the new host): a 3xx reply
+is a counted FAIL for that request. So are a reply that is not UTF-8, an error reply whose
+body cannot be read, and a 200 from /apply-template that is not a JSON object with a string
+"prompt". The --save-baseline FILE's directory must exist and be writable (bench/results/
+is gitignored, so on a fresh clone: mkdir -p bench/results); otherwise the run stops with
+one FAIL line before anything is rendered. An empty or whitespace-only FILE (an unset shell
+variable, say) stops the run with one FAIL line before the port or the key is read.
 
-    python3.13 -I scripts/tests/chat_template_check.py --self-test
+    /opt/homebrew/bin/python3.13 -I scripts/tests/chat_template_check.py --self-test
 
 runs offline checks of the above (no server, no key file read) and exits 0 when they pass.
 """
 import argparse
 import hashlib
 import http.client
+import io
 import json
 import os
 import re
@@ -167,16 +172,59 @@ def read_key():
     return key
 
 
-# Every request goes through this opener. urllib's default opener (urlopen) adds a
-# ProxyHandler built from the environment: http_proxy / HTTP_PROXY / all_proxy (python -I
-# does not clear them), and proxy_bypass("127.0.0.1") is false while such a variable is
-# set, so the request, with its "Authorization: Bearer <key>" header, would go to the proxy
-# host. An empty ProxyHandler replaces that default one: no proxy is ever used.
-OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follows a redirect. urllib's HTTPRedirectHandler copies the request's headers,
+    "Authorization: Bearer <key>" included, to the redirect target whatever its host; and
+    llama-server does not redirect. Being a subclass, this replaces the default handler in
+    build_opener. Every 3xx falls through to HTTPDefaultErrorHandler, so the open raises
+    HTTPError with the 3xx code, which Server.request turns into BAD_REPLY."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+    def refuse(self, req, fp, code, msg, headers):
+        return None
+
+    http_error_301 = http_error_302 = http_error_303 = http_error_307 = http_error_308 = refuse
+
+
+def make_opener():
+    """The opener every request goes through. urllib's default opener (urlopen) adds a
+    ProxyHandler built from getproxies(): http_proxy / HTTP_PROXY in the environment
+    (python -I does not clear them) or, on macOS when neither is set, the system proxy
+    settings; proxy_bypass("127.0.0.1") is false while such a variable is set, so the
+    request, with its "Authorization: Bearer <key>" header, would go to the proxy host. An
+    empty ProxyHandler replaces that default one (no proxy is ever used), and NoRedirect
+    replaces the default HTTPRedirectHandler (no redirect is ever followed)."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+
+
+OPENER = make_opener()
 
 # The status reported in place of an HTTP code when a reply cannot be used. Every caller
 # compares the status with 200, so such a reply is a counted FAIL for its case.
 BAD_REPLY = "(unusable reply)"
+
+
+def http_error_reply(e, method, path):
+    """(status, text) for an HTTPError from OPENER.open. A 3xx (a redirect, never followed)
+    and an error body that cannot be read are BAD_REPLY. No message built here includes the
+    key, the headers or the redirect target."""
+    try:
+        if isinstance(e.code, int) and 300 <= e.code < 400:
+            return BAD_REPLY, "HTTP %d %s %s: a redirect, not followed (llama-server does not redirect)" % (
+                e.code, method, path)
+        try:
+            raw = e.read()
+        except (http.client.HTTPException, OSError) as x:
+            return BAD_REPLY, "HTTP %s %s %s: the error body could not be read (%s)" % (
+                e.code, method, path, x.__class__.__name__)
+        return e.code, raw.decode("utf-8", "replace")
+    finally:
+        try:
+            e.close()
+        except (http.client.HTTPException, OSError):
+            pass
 
 
 class Server:
@@ -186,14 +234,15 @@ class Server:
 
     def request(self, method, path, body=None, timeout=120):
         """(status, text). status is the HTTP code, or BAD_REPLY with a reason in text when
-        the body is not UTF-8. No message built here includes the key or the headers."""
+        the body is not UTF-8, the reply is a redirect or an error body cannot be read. No
+        message built here includes the key or the headers."""
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data, method=method, headers=self._headers)
         try:
             with OPENER.open(req, timeout=timeout) as r:
                 status, raw = r.status, r.read()
         except urllib.error.HTTPError as e:
-            return e.code, e.read().decode("utf-8", "replace")
+            return http_error_reply(e, method, path)
         except (urllib.error.URLError, OSError) as e:
             sys.exit("FAIL: no server at %s (%s); start it with scripts/serve.sh --detach --wait 300"
                      % (self.base, e))
@@ -426,12 +475,18 @@ def self_test():
                 not urllib.request.proxy_bypass("127.0.0.1"))
         c.check("with http_proxy set, a default ProxyHandler would proxy http",
                 urllib.request.ProxyHandler().proxies.get("http") == "http://127.0.0.1:9")
+        os.environ["HTTP_PROXY"] = "http://127.0.0.1:9"
         default = urllib.request.build_opener()
         c.check("with http_proxy set, the default opener (urlopen's) would proxy http",
                 "ProxyHandler" in openers_of(default, "http"), repr(openers_of(default, "http")))
-        same = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        c.check("with http_proxy set, an opener built like OPENER opens http with HTTPHandler only",
-                proxying(same) == [] and openers_of(same, "http") == ["HTTPHandler"], repr(openers_of(same, "http")))
+        # make_opener() is called here, with the variables set, so a make_opener that left
+        # the environment's ProxyHandler in would fail this even when the run started
+        # without any proxy variable (OPENER, built at import, would then pass vacuously).
+        fresh = make_opener()
+        c.check("with http_proxy / HTTP_PROXY set, make_opener() has no ProxyHandler with proxies",
+                proxying(fresh) == [], repr([h.proxies for h in proxying(fresh)]))
+        c.check("with http_proxy / HTTP_PROXY set, make_opener() opens http with HTTPHandler only",
+                openers_of(fresh, "http") == ["HTTPHandler"], repr(openers_of(fresh, "http")))
         c.check("with http_proxy set, OPENER opens http with HTTPHandler only",
                 proxying(OPENER) == [] and openers_of(OPENER, "http") == ["HTTPHandler"])
     finally:
@@ -478,6 +533,82 @@ def self_test():
         OPENER = real
     c.check("request: a non-UTF-8 body is BAD_REPLY", status == BAD_REPLY, repr(status))
     c.check("request: its message does not contain the key", key not in text and "Bearer" not in text, text)
+    # Redirects are never followed. Structure: NoRedirect in place of the default handler.
+    for label, opener in (("OPENER", OPENER), ("make_opener()", make_opener())):
+        plain = [h for h in opener.handlers if type(h) is urllib.request.HTTPRedirectHandler]
+        ours = [h for h in opener.handlers if isinstance(h, NoRedirect)]
+        c.check("%s has NoRedirect and no default HTTPRedirectHandler" % label, plain == [] and len(ours) == 1,
+                repr([type(h).__name__ for h in opener.handlers]))
+    # Behaviour, with no network: hand a 3xx reply to an opener's error chain, with its open()
+    # replaced by a recorder. The default opener follows it, Authorization header included;
+    # make_opener()'s raises HTTPError with the 3xx code and opens nothing.
+    def drive_redirect(opener, code):
+        opened = []
+        opener.open = lambda r, *a, **k: opened.append(r) or "followed"
+        req = urllib.request.Request("http://127.0.0.1:1/props", headers={"Authorization": "Bearer " + key})
+        req.timeout = 5
+        hdrs = http.client.HTTPMessage()
+        hdrs["Location"] = "http://elsewhere.invalid/next"
+        try:
+            result = opener.error("http", req, io.BytesIO(b"moved"), code, "Moved", hdrs)
+        except urllib.error.HTTPError as e:
+            result = e
+        return result, opened
+    result, opened = drive_redirect(urllib.request.build_opener(), 302)
+    c.check("the default opener would follow a 302 with the Authorization header",
+            len(opened) == 1 and opened[0].get_header("Authorization") == "Bearer " + key, repr(result))
+    for code in (301, 302, 303, 307, 308, 300):
+        result, opened = drive_redirect(make_opener(), code)
+        c.check("make_opener() refuses a %d: HTTPError %d, nothing opened" % (code, code),
+                opened == [] and isinstance(result, urllib.error.HTTPError) and result.code == code,
+                repr((type(result).__name__, len(opened))))
+
+    class Raiser:
+        def __init__(self, exc):
+            self.exc = exc
+
+        def open(self, req, timeout=None):
+            raise self.exc
+
+    class BadBody(io.RawIOBase):
+        def __init__(self, exc):
+            self.exc = exc
+
+        def read(self, *a):
+            raise self.exc
+
+    def request_with(exc):
+        global OPENER
+        real = OPENER
+        OPENER = Raiser(exc)
+        try:
+            return Server(1, key).request("GET", "/props")
+        except SystemExit as e:
+            return "exit", str(e)
+        except Exception as e:  # a traceback here is a counted FAIL of the check below
+            return "raised", e.__class__.__name__
+        finally:
+            OPENER = real
+    for code in (301, 302, 307, 308):
+        status, text = request_with(urllib.error.HTTPError(
+            "http://127.0.0.1:1/props", code, "Moved", http.client.HTTPMessage(), io.BytesIO(b"")))
+        c.check("request: a %d reply is BAD_REPLY, message without the key" % code,
+                status == BAD_REPLY and key not in text and "Bearer" not in text and "elsewhere" not in text,
+                repr((status, text)))
+    for exc in (http.client.IncompleteRead(b"par", 10), OSError("reset")):
+        status, text = request_with(urllib.error.HTTPError(
+            "http://127.0.0.1:1/props", 500, "Error", http.client.HTTPMessage(), BadBody(exc)))
+        c.check("request: an error body that fails to read (%s) is BAD_REPLY" % exc.__class__.__name__,
+                status == BAD_REPLY and key not in text and "Bearer" not in text, repr((status, text)))
+    status, text = request_with(urllib.error.HTTPError(
+        "http://127.0.0.1:1/props", 500, "Error", http.client.HTTPMessage(), io.BytesIO(b"boom")))
+    c.check("request: a readable error body keeps its HTTP code", (status, text) == (500, "boom"), repr((status, text)))
+    # An empty or whitespace-only baseline path is refused, not taken as "not given".
+    for save, base, want in (("", None, "--save-baseline"), (None, "", "--baseline"), (" \t", None, "--save-baseline"),
+                             (None, "\n", "--baseline"), (None, None, None), ("b.json", None, None),
+                             (None, "b.json", None)):
+        got = blank_path_flag(argparse.Namespace(save_baseline=save, baseline=base))
+        c.check("blank_path_flag(save=%r, baseline=%r) is %r" % (save, base, want), got == want, repr(got))
     # check_merged on bad replies counts FAILs and returns.
     inner = Checker()
     sys_stdout, sys.stdout = sys.stdout, open(os.devnull, "w")
@@ -516,6 +647,14 @@ def self_test():
     return 1 if c.failed else 0
 
 
+def blank_path_flag(args):
+    """The first baseline flag given with an empty or whitespace-only path, or None."""
+    for flag, value in (("--save-baseline", args.save_baseline), ("--baseline", args.baseline)):
+        if value is not None and not value.strip():
+            return flag
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--port")
@@ -526,12 +665,16 @@ def main():
     args = ap.parse_args()
     if args.self_test:
         return self_test()
-    if args.save_baseline:
+    flag = blank_path_flag(args)
+    if flag:
+        print("FAIL: %s needs a file path, got an empty one" % flag)
+        return 1
+    if args.save_baseline is not None:
         why = baseline_dir_problem(args.save_baseline)
         if why:
             print("FAIL: cannot save the baseline to %s: %s" % (args.save_baseline, why))
             return 1
-    saved = load_baseline(args.baseline) if args.baseline else None
+    saved = load_baseline(args.baseline) if args.baseline is not None else None
     port = valid_port(args.port if args.port is not None else read_port())
     srv = Server(port, read_key())
 
@@ -552,7 +695,7 @@ def main():
     if c.check("GET /props HTTP 200 with a chat_template string", tpl is not None, why):
         print("server chat template: %d chars, md5 %s" % (len(tpl), hashlib.md5(tpl.encode("utf-8")).hexdigest()))
 
-    if args.save_baseline:
+    if args.save_baseline is not None:
         if c.failed:
             print("FAIL: not saving a baseline: the server's chat template could not be identified")
             return 1
@@ -568,7 +711,7 @@ def main():
         return 0
 
     run_checks(c, srv)
-    if args.baseline:
+    if args.baseline is not None:
         now, bad = render_baseline(srv)
         for name, _ in BASELINE:
             if name not in saved:
