@@ -324,6 +324,10 @@ def kind(c):
 # Trace lines bash prints while a caller set function keeps xtrace on: the removal loop for
 # the POISON functions and set, a handful of lines per function. The bound leaves room for
 # a few more functions; the launcher past the removal traces hundreds of lines.
+# Only lines up to the environment scrub are counted: once it unsets POISON's PS4 the trace
+# lines carry no + prefix (with the second set +xv deleted: 165 + lines, then 856 more
+# without one). The count depends on how many functions are exported (POISON's ls and say
+# plus this test's set: 26 lines measured); no_key() is the check that carries the result.
 XTRACE_REMOVAL_LINES = 40
 
 

@@ -111,7 +111,9 @@ power.
 | 27B, off | 5.39 | 556.5 s (35.9 tok/s) | 412 ms | 20/20 | 6,484 ms | 24,103 MiB | 15,679 MiB |
 
 - Default, reasoning off: the 6 misses answered without calling the tool. With reasoning
-  auto the one miss thought for 136 s until it hit max_tokens. Hence `reasoning: auto`
+  auto the one miss (135,933 ms) was one 4,096-token generation, `bench/run.sh`'s
+  `max_tokens`, with no tool call (server log `logs/server-20261114T224923Z.log`, not a
+  bench log). Hence `reasoning: auto`
   for this model and `off` for the 27B.
 - The default-model benches ran on the GGUF's embedded template, before the patched
   one existed (their `flags` show no `--chat-template-file`). The bench requests hold at
@@ -123,8 +125,53 @@ power.
   20K prefill 11.8 s (1,697 tok/s), tools 20/20 (the reference's `config/models.md`; not
   measured here).
 - Decode falls with context depth. From one session's server log (default model,
-  reasoning auto, 2026-11-14; not a bench): 37.5 tok/s near empty, 31.9 at 11K tokens,
-  21.2 at 28K, 13.9 at 50K, 9.9 at 71K. The bench figure is the top of that curve.
+  reasoning auto, 2026-11-14, `logs/server-20261114T230609Z.log`; not a bench): 37.5
+  tok/s near empty, 31.9 at 11K tokens, 21.2 at 28K, 13.9 at 50K, 9.9 at 71K. The bench
+  figure is the top of that curve.
+
+## What has and has not been tested
+
+Bench logs: `bench/results/20261114-155157-tier-s-qwen36-35b-a3b.log` (default,
+reasoning off), `20261114-164939-tier-s-qwen36-35b-a3b-reasoning-auto.log` (default,
+reasoning auto: tools 19/20) and `20261114-160032-pc-model-qwen38-27b-orcarouter.log`
+(the 27B), each with its `.json`.
+
+Real Claude Code sessions, all on the default model and all in print mode:
+
+- 2026-11-14, the first: failed its first turn with HTTP 500 on the GGUF's embedded
+  template (`bench/results/20261114-first-session.json`), which led to the patched one.
+- 2026-11-14, the first working session: 237 requests with no template error (per the
+  commit that added the patched template; its server log,
+  `logs/server-20261114T230609Z.log`, holds 238 completed requests). Read in the session
+  transcript, which was not saved under `bench/results/`: it fixed its fixture bug and
+  never ran the tests (print mode, Known limits), then sent one refused command 219 times
+  (Known limits; that server log holds 219 replies of exactly 176 tokens, with one other
+  request between the 215th and the 216th). The
+  decode-by-context figures above come from this session.
+- 2026-11-14, `--max-turns 2`: ended with `error_max_turns`
+  (`bench/results/20261114-max-turns-2-live.json`).
+- 2026-11-15, the live guard check (Known limits): thirteen sessions of at most 3 turns
+  that tested the guard and the client's permission handling, not the model's work. They
+  still showed a text reply with no tool call to 3 of the 5 first prompts (`s1`-`s5`) and
+  closing text that misreported tool results.
+
+The 27B (the PC's model) was benched here and nothing more: no Claude Code session has
+run on it on this Mac. Its one server log, `logs/server-20261114T220011Z.log`, holds the
+bench's 29 requests and three small ones before them. Apart from the bench's three
+20,000-token prefill prompts, none evaluates more than 372 prompt tokens (the server
+reuses its prompt cache), while a Claude Code turn carries its system prompt and tools
+(the first long request in the first working session's log evaluated 7,275 prompt
+tokens). By the rule in [CLAUDE.md](CLAUDE.md) it is not
+served here.
+
+Not tested on this Mac (UNVERIFIED):
+
+- an interactive session;
+- a print session with the test command pre-approved (`--allowedTools`), so the model can
+  run tests;
+- context compaction with reasoning on;
+- a lighter (quantized) KV cache type on the default model, which runs f16;
+- answer quality at long context: only decode speed was measured there.
 
 ## Switching models
 
@@ -188,7 +235,8 @@ The hook suites (`scripts/hooks/tests/*_test.py`) and the template check are lis
 
 - A command refused by the guard and repeated by the model is bounded only by a turn
   cap. The first working session sent one refused `python3 -c` command 219 times in a
-  row until it was stopped by hand: the guards denied every repeat, but a deny is text
+  row (read in the session transcript, which was not saved under `bench/results/`) until
+  it was stopped by hand: the guards denied every repeat, but a deny is text
   only and does not end the turn (diagnosis in AGENT_LEARNINGS.md, 2026-11-14). In
   print mode the launcher now adds `--max-turns 60` unless you pass `--max-turns N`
   (1 to 10000); the run then ends with result subtype `error_max_turns` (checked on

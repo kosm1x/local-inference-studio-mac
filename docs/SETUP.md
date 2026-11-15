@@ -203,7 +203,8 @@ From the project directory you want to work in:
 
   The first two date from the port's first commit; the session shell line came with the
   pin. The client then printed a note that claude.ai connectors are disabled and
-  `[claude-code:unrecognized_model]`, as in the first working session.
+  `[claude-code:unrecognized_model]`, as in the first working session
+  (`bench/results/20261114-session2.stderr.log`).
 - The session's Bash tool runs `/bin/bash` 3.2 rather than your login zsh, because the
   guard hook reads commands as bash syntax: the aliases, functions and options of
   `~/.zshrc` are not applied to tool commands, and per Claude Code's documentation
@@ -227,11 +228,13 @@ From the project directory you want to work in:
   without a grant it was not tried); `echo =ls` ran without a grant. Re-check after a
   client upgrade.
 - In print mode (`-p`) nobody can answer a permission prompt: a command that needs one
-  comes back "This command requires approval" (first working session; live, `s9`) or,
+  comes back "This command requires approval" (first working session, read in its
+  transcript; live, `s9`) or,
   for a command an ask row matches, "Claude requested permissions to use Bash, but you
   haven't granted it yet." (live, 2026-11-15, `s4b`, `s10`). The first working session
   (237 requests, per the commit that added the patched template) fixed its fixture bug
-  correctly but never ran the tests for that reason, and the guard also refuses inline
+  correctly but never ran the tests for that reason (both read in the session transcript,
+  which was not saved under `bench/results/`), and the guard also refuses inline
   `python3 -c` and running a file written in the same session. Pre-approve the test
   command with `--allowedTools` or work interactively. Tried live: the glob grant
   `Bash(curl *)` let `curl https://example.invalid/x` run, which was refused without it
@@ -245,14 +248,17 @@ From the project directory you want to work in:
   "running" (`s10`), and three first prompts got a text reply with no tool call (`s2`,
   `s4`, `s5`).
 - Give a headless session a time bound and read its transcript after a few minutes. That
-  session sent one refused command 219 times in a row until it was stopped by hand.
+  session sent one refused command 219 times in a row (read in the session transcript,
+  which was not saved under `bench/results/`) until it was stopped by hand.
 - In print mode the launcher adds `--max-turns 60` (stderr: `print mode without
   --max-turns: added --max-turns 60`); pass `--max-turns N` (1 to 10000) to change it. At
   the cap the JSON result has `"subtype":"error_max_turns"` and `"is_error":true` (live
   run with `--max-turns 2`, 2026-11-14: `bench/results/20261114-max-turns-2-live.json`,
   gitignored). It
   caps turns, not the time one turn takes, so the time bound above still applies.
-- A model counts as served only after one real session like this has run.
+- A model counts as served only after one real session like this has run. On this Mac
+  only the default model has had one; the README section "What has and has not been
+  tested" lists the sessions and what was never tried.
 
 ## 11. Stop
 
@@ -272,6 +278,7 @@ with `pkill`, `killall` or a computed kill.
 | `serve.sh: refusing to start: ... sha256 ..., ... says ...` (or `... bytes`) | The file differs from the manifest. Delete it and download again at the pinned revision (steps 4-5). |
 | `serve.sh: model file not found: ...` | The path in the entry does not match the download location. |
 | `serve.sh: another server holds logs/serve.lock ...` or `port 8080 is already in use` | A server is running. `scripts/stop.sh`, or change `PORT` in `config/lis.conf`. |
+| `serve.sh: removing stale lock .../logs/serve.lock` on the first start after `scripts/stop.sh` | Expected and harmless. A `--detach` start leaves the lock in place while its server runs (the lock also records the server log that `stop.sh` appends to), and `stop.sh` removes only the pid file. The next start finds neither the lock's `serve.sh` nor a llama-server alive, removes the lock and takes a new one. |
 | `serve.sh: ... is not on serve.sh's allow-list of extra llama-server flags` | The flag in `server_args` or after `--` is not allowed; see the table in models/README.md. |
 | `stop.sh: refusing: pid ... runs ..., not the installed llama-server ...` | Often a server started before `brew upgrade llama.cpp`. Stop it with Ctrl-C in its `serve.sh` terminal. |
 | `smoke.sh` / `bench/run.sh`: `no key file ...` | No server has started since `logs/` was cleared. Start one. |
