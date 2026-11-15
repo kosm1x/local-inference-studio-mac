@@ -1893,6 +1893,101 @@ def procsubst(s):
         i = j
 
 
+# W-19 follow-up: the openers the upload read takes: <( and >( anywhere in a word (bash and
+# zsh substitute x<(...) too), and zsh's =( ) at the start of a word only (X=(a b) is an
+# array assignment, not a substitution). Read raw: a quoted one is read as well.
+_PS_OPEN = re.compile(r'[<>]\(|(?:^|(?<=[\s;&|()<>\'"`{}]))=\(')
+
+
+def procsubst_bodies(s):
+    """Inner text of every top-level <( ), >( ) and word-initial =( ) in s, for the upload
+    read (the >( )-only critical-path scan keeps procsubst()). The body ends at the ) that
+    closes it outside quotes: '...', "..." and $'...' (backslash escapes inside the last
+    two) and a backslash-escaped character are skipped, so `curl -d 'a)b' https://e` is
+    not cut at its quoted ). An unclosed body runs to the end of s; one that ends inside a
+    quote gets that quote closed, so it still tokenises and its upload is still read."""
+    out, i, n = [], 0, len(s)
+    while (m := _PS_OPEN.search(s, i)) is not None:
+        j, depth, q = m.end(), 1, None
+        while j < n:
+            c = s[j]
+            if q == "'":
+                if c == "'":
+                    q = None
+            elif q is not None:                 # inside "..." or $'...'
+                if c == '\\':
+                    j += 1
+                elif c == q[-1]:
+                    q = None
+            elif c == '\\':
+                j += 1
+            elif c in '\'"':
+                q = c
+            elif c == '$' and s.startswith("$'", j):
+                q, j = "$'", j + 1
+            elif c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+                if not depth:
+                    break
+            j += 1
+        if j < n:
+            out.append(s[m.end():j])
+            i = j + 1
+        else:
+            out.append(s[m.end():] + (q[-1] if q else ''))
+            return out
+    return out
+
+
+UPLOAD_REASON = 'network upload to a non-loopback host'
+_UPLOAD_WORD = re.compile(r'(?i)curl|wget')
+# body characters walked per line. Not only above the 32 KB input cap: a second read that
+# grows a line (brace expansion; review 2026-11-14) can pass it under the cap. Past it the
+# line gets no decision, never an allow
+PROCSUBST_BUDGET = 8 * MAX_INPUT
+
+
+def procsubst_upload(cmd, depth=0, budget=None):
+    """W-19 follow-up: the network-upload rule (curl/wget only) for the body of every
+    <( ... ), >( ... ) and zsh =( ... ) in cmd (procsubst_bodies), nested ones too, each body
+    read as walk() reads a $( ) body (its segments, $( ), backticks, groups, bash -c, ssh),
+    with the seg_upload()/upload_hit() calls the critical() loop makes. The text is read raw:
+    a quoted "<(...)" (no substitution in the shell) is read as well, an accepted false
+    positive. Bounded like $( ): MAX_DEPTH levels. A body with no curl or wget in it (quotes
+    and backslashes dropped) is not walked; past PROCSUBST_BUDGET walked characters the line
+    gets no decision (also under MAX_INPUT, when a second read grew the line)."""
+    budget = budget if budget is not None else [PROCSUBST_BUDGET]
+    if depth >= MAX_DEPTH:
+        return None
+    for inner in procsubst_bodies(cmd):
+        if not _UPLOAD_WORD.search(re.sub(r'[\'"\\]', '', inner)):
+            continue                        # nothing here or below can be a curl/wget upload
+        budget[0] -= len(inner)
+        if budget[0] < 0:
+            _UNDECIDED[0] = True            # no decision, never an allow
+            return None
+        for c, seg in walk(inner, 'local', depth + 1):
+            if c in ('py', 'js'):
+                continue                    # their string literals come back as 'lit'
+            if c == 'ps':
+                pt = strip_env(tokens(re.sub(r'^\s*&\s*', '', seg.replace('`', ''))) or [], False) or []
+                why = upload_hit(exe(pt[0]), pt[1:]) if pt else None
+            elif c == 'remote':
+                rt = strip_env(tokens(seg) or [], False) or []
+                why = upload_hit(exe(rt[0]), rt[1:]) if rt else None
+                why = why and f'remote-host {why}'
+            else:
+                toks = tokens(seg)
+                why = seg_upload(toks, seg) if toks else None
+            if why in (UPLOAD_REASON, f'remote-host {UPLOAD_REASON}'):
+                return why                  # nc, scp, rsync: other rules, not read here
+        if why := procsubst_upload(inner, depth + 1, budget):
+            return why
+    return None
+
+
 def critical(cmd, ctx0='local', _alt=False):
     """Name of the critical write/delete in cmd, or None."""
     hit = critical_verb(cmd) or (not _alt and critical_verb(join_concat(cmd))) or cred_glob(cmd)
@@ -2064,6 +2159,11 @@ def critical(cmd, ctx0='local', _alt=False):
         if v == 'find' and any(f in ('-fprint', '-fprint0', '-fprintf', '-fls') or f.startswith('-fprint') for f in args) \
                 and any(CRITICAL_PATH.search(t) for t in nonflag):
             return 'find -fprint into a critical path'
+    # W-19 follow-up: a curl/wget upload inside <( ) or >( ), judged as inside $( ). Last,
+    # so a line another rule above denies keeps that rule's reason; the second reads (ANSI-C
+    # decoded, braces expanded) come here too, as for a $( ) body
+    if ctx0 not in ('py', 'js', 'ps') and (why := procsubst_upload(cmd)):
+        return why
     return None
 
 

