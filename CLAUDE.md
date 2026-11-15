@@ -37,14 +37,15 @@ the reference checkout, where present, is read-only).
 
 ## Git
 
-- The repo has one remote, `origin`, a private GitHub repository (the owner's decision of
-  2026-11-15; it was local only before). Push only when the owner asks, never force-push,
-  and do not change its visibility or add another remote.
+- The repo has one remote, `origin`, a PUBLIC GitHub repository (the owner's decisions of
+  2026-11-15; it was local only before). Everything committed is published: push only
+  when the owner asks, never force-push, and do not change its visibility or add another
+  remote.
 - Commit only when asked. Messages say why. They end with a `Co-Authored-By:` trailer
   and carry no session URL.
 - No user names, home paths (write `~/...` or repo-relative paths), host names, email
-  addresses, session URLs or secrets in tracked files. Grep every added line before a
-  commit.
+  addresses, session URLs or secrets in tracked files or commit messages. Grep every
+  added line before a commit, and the commit messages before a push.
 - Every built change gets an independent audit before the commit.
 
 ## macOS

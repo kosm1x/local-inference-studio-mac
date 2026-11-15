@@ -515,5 +515,5 @@ The hook suites (`scripts/hooks/tests/*_test.py`) and the template check are lis
 ## Rules
 
 Agent rules are in [CLAUDE.md](CLAUDE.md). In short: no Ollama or LM Studio; models and
-binaries are never committed; scripts never pipe to a shell; the repo's one remote is private and a push needs the
-owner's word.
+binaries are never committed; scripts never pipe to a shell; the repo is public, so nothing personal goes into a
+tracked file or a commit message, and a push needs the owner's word.
