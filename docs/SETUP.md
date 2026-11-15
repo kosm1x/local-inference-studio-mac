@@ -1,0 +1,239 @@
+# Setup from scratch (Apple silicon Mac)
+
+What was done on this machine (MacBook Air, Apple M4, 32 GB, macOS 26.5.2) to get from an
+empty disk to a Claude Code session on a local model, in order. Commands run from the repo
+root unless a step says otherwise. Anything not done here is marked UNVERIFIED.
+
+## 0. Before you start
+
+- Apple silicon, with Homebrew under `/opt/homebrew` (Homebrew 7.0.13 here). Installing
+  Homebrew itself is not covered here.
+- Disk: 15.44 GB for the default model, 10.38 GB for the second one.
+- Memory: the default model's bench peaked at 27,256 MiB system memory in use (README).
+  Judge a fit against memory actually free at start, not the 32 GB on the box.
+- Pre-flight before any start or bench:
+
+  ```bash
+  sysctl vm.swapusage   # swap in use; a large figure means the machine is not ready
+  pmset -g | grep -i lowpowermode   # 0 = Low Power Mode off
+  vm_stat               # serve.sh also logs "memory free: <N> MiB available" at start
+  ```
+
+  Close large apps first. The 2026-11-14 benches ran with a browser open, on AC power.
+
+## 1. The repo
+
+The repo is local only (no remote). Copy it, or `git clone` an existing local checkout,
+to a directory you own. Below, `<repo>` stands for that path. Nothing in it needs root.
+
+## 2. llama.cpp and Python (Homebrew)
+
+```bash
+brew install llama.cpp python@3.13
+/opt/homebrew/bin/llama-server --version   # version: 1.0.0 (build 12359, commit b1b770d90)
+/opt/homebrew/bin/python3.13 --version     # Python 3.13.18
+```
+
+- `serve.sh` and `stop.sh` take `llama-server` from `/opt/homebrew/bin` (else
+  `/usr/local/bin`), never from `PATH`. `serve.sh` and `claude-local.sh` take
+  `python3.13` the same way. Both refuse a program whose real file or directory is owned
+  by anyone but root and you, or writable by others (`serve.sh` checks every directory up
+  to the prefix). `smoke.sh` and `bench/run.sh` use the `python3.13` on `PATH`.
+- llama.cpp is never built from source or vendored here (`bin/` is gitignored).
+- The extra-flag allow-list in `scripts/serve.sh` (`ALLOWED_FLAGS`) is pinned to build
+  12359. After `brew upgrade llama.cpp`, re-read `llama-server --help` against it
+  before trusting a start. Stop the server before upgrading: `stop.sh` checks the
+  running executable against the installed one and refuses a server started from the
+  old file (how `lsof` names the replaced file is UNVERIFIED).
+
+## 3. Claude Code CLI
+
+This machine runs Claude Code 2.1.325 as the native build at `~/.local/bin/claude` (a
+link into `~/.local/share/claude/versions/`). Install it as Anthropic's Claude Code
+documentation describes; how it was installed here is not recorded. If an installer
+script is involved, download it to a file and read it before running it; never pipe a
+download into a shell.
+
+```bash
+claude --version   # 2.1.325 (Claude Code)
+```
+
+`claude-local.sh` finds `claude` on `PATH`. Its pass-through allow-list (`PASS_LIST`) was
+read from `claude --help` of 2.1.322; re-read it after every client upgrade.
+
+## 4. Download a model (by hand)
+
+No script downloads anything. Pick a file, take the commit it should come from (the
+revision), and fetch it at that revision into its own directory under `models/`. The
+default model:
+
+```bash
+mkdir -p models/qwen3.6-35b-a3b-heretic
+curl -L --fail -C - \
+  -o models/qwen3.6-35b-a3b-heretic/Qwen3.6-35B-A3B-uncensored-heretic.i1-IQ3_M.gguf \
+  https://huggingface.co/mradermacher/Qwen3.6-35B-A3B-uncensored-heretic-i1-GGUF/resolve/97c91a931dbfd582487e8866bd129a2e8765051d/Qwen3.6-35B-A3B-uncensored-heretic.i1-IQ3_M.gguf
+```
+
+The second model (dense 27B):
+
+```bash
+mkdir -p models/qwen3.8-27b-orcarouter-gsq-rco
+curl -L --fail -C - \
+  -o models/qwen3.8-27b-orcarouter-gsq-rco/Qwen3.8-27B-OrcaRouter-GSQ-RCO-IQ3_XXS-v2.1.gguf \
+  https://huggingface.co/RentedNoodle/Qwen3.8-27B-OrcaRouter-GSQ-RCO-IQ3_XXS-Uncensored/resolve/2113bb22c43635fcdaad4b728c914db4c2ec1d3b/Qwen3.8-27B-OrcaRouter-GSQ-RCO-IQ3_XXS-v2.1.gguf
+```
+
+- `-L` follows the redirect to the file store, `--fail` stops on an HTTP error instead
+  of saving the error page as the model, `-C -` resumes a partial file: re-run the same
+  command after an interruption.
+- The revision in the URL pins the bytes; a branch name (`main`) would not.
+- Model files are gitignored (`.gitignore`: everything under `models/` except
+  `models/manifest.json` and `models/README.md`, plus `*.gguf` and `*.zip` anywhere);
+  never commit one.
+
+## 5. Check the file and record it in the manifest
+
+```bash
+stat -f %z models/qwen3.6-35b-a3b-heretic/Qwen3.6-35B-A3B-uncensored-heretic.i1-IQ3_M.gguf
+shasum -a 256 models/qwen3.6-35b-a3b-heretic/Qwen3.6-35B-A3B-uncensored-heretic.i1-IQ3_M.gguf
+```
+
+Compare the sha256 with the publisher's: on Hugging Face, the LFS SHA256 shown on the
+file's page at the same revision. If they differ, delete the file. Then record both
+values in the file's `models/manifest.json` entry (`size` as an integer, `sha256` as 64
+lowercase hex characters). The two shipped entries already hold the values measured
+here, which matched the publisher's:
+
+- `qwen3.6-35b-a3b-heretic-iq3m`: size 15440520352, sha256
+  `18f3d1853052d31fd1012291768daa6dcd81479e10b92436e2f2b04426ea36e0`
+- `qwen3.8-27b-orcarouter-iq3xxs`: size 10382717184, sha256
+  `ab955b5083d9cdf0bf55c37acdcae359b78756c4544d97960c23d8fca98feb9b`
+
+A new entry's fields and rules are in
+[models/README.md](../models/README.md). The first start after each boot hashes the file
+again and refuses on any difference (marker `logs/model-verify.txt`).
+
+## 6. Chat template
+
+Claude Code sends system messages after the first one: llama-server converts a Claude
+Code request into a message list like `[system, user, system, ...]` before it applies
+the chat template. A template that raises on a later system message turns every such
+turn into HTTP 500. The default model's embedded template does exactly that (first real
+session, 2026-11-14: "System message must be at the beginning."), although smoke and
+bench passed on it, because neither sends that shape.
+
+- Both manifest entries point at a patched template in `config/chat-templates/` (the
+  `chat_template` field), so switching `MODEL_ID` switches the template too. Each file's
+  header says where it came from and what was changed.
+- For a new model: the embedded template is the `chat_template` field of `GET /props`
+  (the shipped Qwen3.6 file was extracted that way); send the key from a file, as
+  `smoke.sh` does, never on a command line. Start the server on the embedded template
+  and save a baseline, then patch, point the entry at the patched file, restart, and
+  compare:
+
+  ```bash
+  mkdir -p bench/results   # gitignored, so absent on a fresh clone
+  /opt/homebrew/bin/python3.13 -I scripts/tests/chat_template_check.py --save-baseline bench/results/<name>-baseline.json
+  # write config/chat-templates/<name>.jinja, add "chat_template" to the entry, restart
+  /opt/homebrew/bin/python3.13 -I scripts/tests/chat_template_check.py --baseline bench/results/<name>-baseline.json
+  ```
+
+  The check renders the shapes Claude Code sends through `POST /apply-template`, makes
+  one real `/v1/chat/completions` call, and ends with `PASS` (exit 0). With
+  `--baseline` it also requires every single-system conversation to render byte for byte
+  as the unpatched template did.
+
+## 7. First start
+
+```bash
+scripts/serve.sh --dry-run             # the exact llama-server command line; starts nothing
+scripts/serve.sh --detach --wait 300   # returns 0 once GET /health answers 200
+```
+
+- The dry run for the default model shows `-ctk f16 -ctv f16`, `--reasoning auto`,
+  `--chat-template-file .../qwen3.6-35b-a3b.jinja` and `--swa-full`.
+- Each start writes a new random key to `logs/api-key` (mode 600) and a server log
+  `logs/server-<UTC stamp>.log` whose first line is the command line. The server binds
+  127.0.0.1 only and runs `--offline`.
+- Without `--detach`, llama-server runs in the foreground; Ctrl-C stops it.
+
+## 8. Smoke and template check
+
+```bash
+scripts/smoke.sh
+/opt/homebrew/bin/python3.13 -I scripts/tests/chat_template_check.py
+```
+
+`smoke.sh` checks health, a text reply, a `tool_use` and a `tool_result` round trip and
+ends with `PASS: health, text, tool_use and tool_result round trip`. The template check
+ends with `PASS`.
+
+## 9. Bench
+
+```bash
+bench/run.sh --label <name> --quant IQ3_M --ctx 131072
+```
+
+It benches the running server (it never starts or stops one) and writes
+`bench/results/<stamp>-<label>.json` plus the tee'd console log `<stamp>-<label>.log`.
+A run took about 5 minutes on the default model with reasoning off, about 9 with
+reasoning auto and about 33 on the 27B (start and end stamps in the saved files). Results
+are in the README. To bench a reasoning setting other than the manifest's, restart with
+`scripts/serve.sh --detach --wait 300 --reasoning off` (or `on`, `auto`).
+
+## 10. First session
+
+From the project directory you want to work in:
+
+```bash
+<repo>/scripts/claude-local.sh                  # interactive
+<repo>/scripts/claude-local.sh --print-args     # show the arguments only
+<repo>/scripts/claude-local.sh --start-server   # start the server first if /health is not ok
+<repo>/scripts/claude-local.sh -p "<task>" --permission-mode acceptEdits
+```
+
+- The launcher prints `user scope: off`, `guard: on` and `context tokens: 114688` on
+  stderr. The client then printed `[claude-code:unrecognized_model]` and a note that
+  claude.ai connectors are disabled; both appeared in the working session too.
+- In print mode (`-p`) nobody can answer a permission prompt: a command that needs one
+  comes back "This command requires approval". The first working session (237 requests,
+  per the commit that added the patched template) fixed its fixture bug correctly but
+  never ran the tests for that reason, and the guard also refuses inline `python3 -c` and
+  running a file written in the same session. Pre-approve the test command
+  (`--allowedTools`; not yet tried here, UNVERIFIED) or work interactively.
+- Give a headless session a time bound and read its transcript after a few minutes. That
+  session sent one refused command 219 times in a row until it was stopped by hand.
+- In print mode the launcher adds `--max-turns 60` (stderr: `print mode without
+  --max-turns: added --max-turns 60`); pass `--max-turns N` (1 to 10000) to change it. At
+  the cap the JSON result has `"subtype":"error_max_turns"` and `"is_error":true` (live
+  run with `--max-turns 2`, 2026-11-14: `bench/results/20261114-max-turns-2-live.json`,
+  gitignored). It
+  caps turns, not the time one turn takes, so the time bound above still applies.
+- A model counts as served only after one real session like this has run.
+
+## 11. Stop
+
+```bash
+scripts/stop.sh   # stopping llama-server pid <N>, then: stopped pid <N>
+```
+
+It stops the one pid in `logs/llama-server.pid`, after checking that it runs the
+installed llama-server, with SIGTERM and a wait of up to 30 s. Never stop the server
+with `pkill`, `killall` or a computed kill.
+
+## 12. Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| Every Claude Code turn: HTTP 500 "System message must be at the beginning." | The template raises on a later system message. Give the entry a patched `chat_template` (step 6) and run `chat_template_check.py`. |
+| `serve.sh: refusing to start: ... sha256 ..., ... says ...` (or `... bytes`) | The file differs from the manifest. Delete it and download again at the pinned revision (steps 4-5). |
+| `serve.sh: model file not found: ...` | The path in the entry does not match the download location. |
+| `serve.sh: another server holds logs/serve.lock ...` or `port 8080 is already in use` | A server is running. `scripts/stop.sh`, or change `PORT` in `config/lis.conf`. |
+| `serve.sh: ... is not on serve.sh's allow-list of extra llama-server flags` | The flag in `server_args` or after `--` is not allowed; see the table in models/README.md. |
+| `stop.sh: refusing: pid ... runs ..., not the installed llama-server ...` | Often a server started before `brew upgrade llama.cpp`. Stop it with Ctrl-C in its `serve.sh` terminal. |
+| `smoke.sh` / `bench/run.sh`: `no key file ...` | No server has started since `logs/` was cleared. Start one. |
+| `chat_template_check.py`: `FAIL: no server at ...` | Start the server (step 7). |
+| Bench `tools` low, misses are `no_call` | Replay those prompts and read the replies: an invented answer points at the reasoning setting (the default model needs `auto`); a tool call printed as text points at the template. |
+| `-p` session: "This command requires approval" | Print mode cannot answer prompts; pre-approve the command or run interactively. |
+| The model repeats one refused command | Known limit. A print-mode run stops at its turn cap (`--max-turns`, default 60); an interactive one must be stopped by hand. |
+| Replies slow down as a session grows | Expected: decode falls with context depth (README). |

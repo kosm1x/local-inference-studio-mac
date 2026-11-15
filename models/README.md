@@ -75,10 +75,11 @@ Model payloads (`*.gguf` and anything else under here except this file and
   `config/` (no symlinked directory leading out), and the file must exist. A set
   `CHAT_TEMPLATE` is still checked when this field replaces it.
   Claude Code needs a template that accepts system messages after the first one
-  (llama-server sends its turns as `[system, user, system, ...]`; a template that raises
-  on them makes every turn an HTTP 500). Both shipped entries carry such a template
+  (llama-server converts a Claude Code request into a message list of the form
+  `[system, user, system, ...]` before it applies the template; a template that raises
+  on a later system message makes every such turn an HTTP 500). Both shipped entries carry such a template
   (`config/chat-templates/`, each with a header saying what was patched). For a new model,
-  start the server on it and run `python3.13 -I scripts/tests/chat_template_check.py`.
+  start the server on it and run `/opt/homebrew/bin/python3.13 -I scripts/tests/chat_template_check.py`.
 - `sampling`: an object with any of `temp` (number >= 0), `top_p` (number from 0 to 1)
   and `top_k` (integer >= 0). Each key given replaces that default (0.6, 0.95, 20); a
   key left out keeps its default. Numbers only: strings, booleans, `NaN` and

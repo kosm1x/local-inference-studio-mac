@@ -37,7 +37,10 @@ NOTALLOW = object()  # auditor's "!allow": deny or no decision both pass
 MAC_DENIED = {'scripts/serve.sh', 'scripts/stop.sh', 'scripts/smoke.sh', 'bench/run.sh',
               'scripts/claude-local.sh', 'scripts/tests/claude_local_test.py',
               # the server tests quote the kill shapes they check serve.sh and stop.sh against
-              'scripts/tests/serve_test.py', 'scripts/tests/stop_test.py'}
+              'scripts/tests/serve_test.py', 'scripts/tests/stop_test.py',
+              # reads the server key and sends HTTP requests to a URL built at run time
+              # (not a literal loopback address): an operator check, refused on purpose
+              'scripts/tests/chat_template_check.py'}
 
 
 def exempt_body(name):

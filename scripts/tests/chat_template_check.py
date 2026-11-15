@@ -13,8 +13,14 @@ conversations through llama-server's POST /apply-template ({"messages": [...], "
 [...]} in, {"prompt": "..."} out; checked on llama-server 1.0.0, build 12359) and checks,
 in both the tools and the no-tools branch of the template:
 
-  (a) [system, user, system, user]: HTTP 200, both system texts exactly once, in order,
-      inside the one leading system block, and no second "<|im_start|>system";
+  (a) [system, user, system, user]: HTTP 200, one "<|im_start|>system" only, each system
+      text exactly once in the prompt, and the whole leading system block exactly equal to
+      the expected one. Expected = the leading system block of the SAME request rendered
+      with its system messages removed (a second /apply-template call; in the tools branch
+      that is the template's tools preamble), then a blank line, then the system texts
+      joined by blank lines. When that second render has no system block (the no-tools
+      branch of both shipped templates when no reasoning text is added), the expected block
+      is the joined texts alone;
   (b) the same for [system, user, assistant, user, system];
   (c) a conversation without a system message still renders;
   (d) a system message with empty (or whitespace-only) content adds nothing;
@@ -27,13 +33,34 @@ while the server uses the template to compare against (e.g. the GGUF's embedded 
 to render exactly as saved.
 
 The API key is read from the first line of logs/api-key and sent as a header; it is never
-printed or passed on a command line. The port comes from config/lis.conf (PORT=) unless
---port is given. Exit status 0 = all checks passed.
+printed or passed on a command line (it must be the 64 lowercase hex characters serve.sh
+writes; anything else, an empty file included, stops the run with a message that does not
+show the file's content). The port comes from config/lis.conf (PORT=) unless --port is
+given, and must be a decimal integer 1-65535. GET /props must answer HTTP 200 with a string
+chat_template: anything else is reported as a failure (with --save-baseline nothing is
+written, since the template being saved could not be identified). Exit status 0 = all
+checks passed.
+
+No proxy is ever used: every request goes through OPENER, built with an empty
+ProxyHandler, so http_proxy / HTTP_PROXY / all_proxy in the environment (which -I does not
+clear) cannot route the request, and its Authorization header, to a proxy host. A reply
+that is not UTF-8, or a 200 from /apply-template that is not a JSON object with a string
+"prompt", is a counted FAIL for that case. The --save-baseline FILE's directory must exist
+and be writable (bench/results/ is gitignored, so on a fresh clone: mkdir -p bench/results);
+otherwise the run stops with one FAIL line before anything is rendered.
+
+    python3.13 -I scripts/tests/chat_template_check.py --self-test
+
+runs offline checks of the above (no server, no key file read) and exits 0 when they pass.
 """
 import argparse
 import hashlib
+import http.client
 import json
+import os
+import re
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -106,6 +133,10 @@ BASELINE += [
 ]
 
 
+PORT_RE = re.compile(r"[1-9][0-9]{0,4}")  # ASCII digits only, no sign, no leading zero
+KEY_RE = re.compile(r"[0-9a-f]{64}")
+
+
 def read_port():
     for line in CONF.read_text().splitlines():
         if line.startswith("PORT="):
@@ -113,31 +144,80 @@ def read_port():
     sys.exit("FAIL: no PORT= line in config/lis.conf")
 
 
+def valid_port(text):
+    """The port as an int, or exit. Checked before any URL is built from it."""
+    if not PORT_RE.fullmatch(text) or int(text) > 65535:
+        sys.exit("FAIL: the port must be an integer 1-65535, got %r" % text)
+    return int(text)
+
+
+def read_key():
+    """The first line of logs/api-key, or exit. The content is never shown in a message."""
+    try:
+        lines = KEYFILE.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        lines = []
+    except (OSError, UnicodeDecodeError) as e:
+        sys.exit("FAIL: cannot read logs/api-key (%s)" % e.__class__.__name__)
+    key = lines[0].strip() if lines else ""
+    if not key:
+        sys.exit("FAIL: logs/api-key is missing or empty (start the server with scripts/serve.sh)")
+    if not KEY_RE.fullmatch(key):
+        sys.exit("FAIL: logs/api-key does not hold a 64-hex key (start the server with scripts/serve.sh)")
+    return key
+
+
+# Every request goes through this opener. urllib's default opener (urlopen) adds a
+# ProxyHandler built from the environment: http_proxy / HTTP_PROXY / all_proxy (python -I
+# does not clear them), and proxy_bypass("127.0.0.1") is false while such a variable is
+# set, so the request, with its "Authorization: Bearer <key>" header, would go to the proxy
+# host. An empty ProxyHandler replaces that default one: no proxy is ever used.
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+# The status reported in place of an HTTP code when a reply cannot be used. Every caller
+# compares the status with 200, so such a reply is a counted FAIL for its case.
+BAD_REPLY = "(unusable reply)"
+
+
 class Server:
-    def __init__(self, port):
-        self.base = "http://127.0.0.1:%s" % port
-        key = KEYFILE.read_text().splitlines()[0].strip() if KEYFILE.exists() else ""
-        if not key:
-            sys.exit("FAIL: logs/api-key is missing or empty (start the server with scripts/serve.sh)")
+    def __init__(self, port, key):
+        self.base = "http://127.0.0.1:%d" % port
         self._headers = {"Content-Type": "application/json", "Authorization": "Bearer " + key}
 
     def request(self, method, path, body=None, timeout=120):
+        """(status, text). status is the HTTP code, or BAD_REPLY with a reason in text when
+        the body is not UTF-8. No message built here includes the key or the headers."""
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data, method=method, headers=self._headers)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return r.status, r.read().decode("utf-8")
+            with OPENER.open(req, timeout=timeout) as r:
+                status, raw = r.status, r.read()
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode("utf-8", "replace")
         except (urllib.error.URLError, OSError) as e:
             sys.exit("FAIL: no server at %s (%s); start it with scripts/serve.sh --detach --wait 300"
                      % (self.base, e))
+        except http.client.HTTPException as e:
+            sys.exit("FAIL: malformed HTTP reply from %s%s (%s)" % (self.base, path, e.__class__.__name__))
+        try:
+            return status, raw.decode("utf-8")
+        except UnicodeDecodeError as e:
+            return BAD_REPLY, "HTTP %d %s %s: the body (%d bytes) is not UTF-8 (byte %d)" % (
+                status, method, path, len(raw), e.start)
 
     def render(self, body):
+        """(status, prompt, text). prompt is None unless status is 200 and the reply is a
+        JSON object with a string "prompt"; otherwise status is the HTTP code or BAD_REPLY."""
         status, text = self.request("POST", "/apply-template", body)
         if status != 200:
             return status, None, text
-        return status, json.loads(text)["prompt"], text
+        try:
+            reply = json.loads(text)
+        except (ValueError, RecursionError):
+            return BAD_REPLY, None, "HTTP 200 /apply-template: the body is not JSON: " + text[:200]
+        if not isinstance(reply, dict) or not isinstance(reply.get("prompt"), str):
+            return BAD_REPLY, None, 'HTTP 200 /apply-template: no string "prompt" in the reply: ' + text[:200]
+        return status, reply["prompt"], text
 
 
 class Checker:
@@ -155,7 +235,20 @@ def system_block(prompt):
     """The leading system block's text, or None when the prompt has none."""
     if not prompt.startswith(SYS_OPEN):
         return None
-    return prompt[len(SYS_OPEN):prompt.index(END)]
+    end = prompt.find(END)
+    # No end marker: the rest of the prompt, which then fails the exact comparison.
+    return prompt[len(SYS_OPEN):] if end < 0 else prompt[len(SYS_OPEN):end]
+
+
+def without_system(body):
+    """The same request body with every system message removed (all other keys kept)."""
+    out = dict(body)
+    out["messages"] = [m for m in body["messages"] if m.get("role") != "system"]
+    return out
+
+
+def first_diff(a, b):
+    return next((i for i in range(min(len(a), len(b))) if a[i] != b[i]), min(len(a), len(b)))
 
 
 def check_merged(c, srv, name, body, texts):
@@ -169,11 +262,23 @@ def check_merged(c, srv, name, body, texts):
         return
     c.check(name + " system texts once each", all(prompt.count(t) == 1 for t in texts),
             "counts %s" % [prompt.count(t) for t in texts])
-    pos = [block.find(t) for t in texts]
-    c.check(name + " system texts in the block, in order", all(p >= 0 for p in pos) and pos == sorted(pos),
-            "positions in block %s" % pos)
-    c.check(name + " blank-line separated, block ends with the last text",
-            block.endswith("\n\n".join(texts)), "block tail %r" % block[-120:])
+    # The expected block is derived, not hard-coded: what the template puts in the block
+    # for this request without any system message (the tools preamble in the tools branch,
+    # usually nothing in the no-tools branch), then the system texts, blank-line separated.
+    rstatus, rprompt, rraw = srv.render(without_system(body))
+    if not c.check(name + " reference render without system messages HTTP 200", rstatus == 200,
+                   "HTTP %s: %s" % (rstatus, rraw[:300])):
+        return
+    base = system_block(rprompt)
+    if "tools" in body and not c.check(name + " reference render has a tools system block", base is not None,
+                                       "starts %r" % rprompt[:120]):
+        return
+    joined = "\n\n".join(texts)
+    expected = joined if base is None else base + "\n\n" + joined
+    at = first_diff(block, expected)
+    c.check(name + " system block exactly as expected (%d chars)" % len(expected), block == expected,
+            "lengths %d/%d, first difference at char %d: got %r / expected %r"
+            % (len(block), len(expected), at, block[max(0, at - 20):at + 60], expected[max(0, at - 20):at + 60]))
 
 
 def same_render(c, srv, name, body_a, body_b):
@@ -224,13 +329,191 @@ def run_checks(c, srv):
 
 
 def render_baseline(srv):
-    out = {}
+    """({name: prompt}, {name: why}) for the BASELINE cases; a case that does not render
+    is in the second dict, not the first."""
+    out, bad = {}, {}
     for name, body in BASELINE:
         status, prompt, raw = srv.render(body)
         if status != 200:
-            sys.exit("FAIL: baseline case %s: HTTP %s: %s" % (name, status, raw[:300]))
-        out[name] = prompt
-    return out
+            bad[name] = "HTTP %s: %s" % (status, raw[:300])
+        else:
+            out[name] = prompt
+    return out, bad
+
+
+def baseline_dir_problem(path):
+    """Why FILE cannot be written, judged on its directory before anything is rendered,
+    or None. The write itself is still checked (save_baseline)."""
+    d = Path(path).parent
+    if not d.is_dir():
+        return "directory %s does not exist (mkdir -p it first; bench/results/ is gitignored)" % d
+    if not os.access(d, os.W_OK | os.X_OK):
+        return "directory %s is not writable" % d
+    return None
+
+
+def save_baseline(path, out):
+    """Write the baseline; True, or False after one FAIL line."""
+    try:
+        Path(path).write_text(json.dumps(out, indent=1, sort_keys=True) + "\n")
+    except OSError as e:
+        print("FAIL: cannot write the baseline file %s (%s: %s)" % (path, e.__class__.__name__, e.strerror))
+        return False
+    return True
+
+
+def load_baseline(path):
+    """The saved {name: prompt} dict, or exit with one FAIL line."""
+    try:
+        saved = json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError as e:
+        sys.exit("FAIL: cannot read the baseline file %s (%s: %s)" % (path, e.__class__.__name__, e.strerror))
+    except (ValueError, RecursionError):
+        sys.exit("FAIL: the baseline file %s is not JSON" % path)
+    if not isinstance(saved, dict) or not all(isinstance(v, str) for v in saved.values()):
+        sys.exit("FAIL: the baseline file %s is not a JSON object of strings" % path)
+    return saved
+
+
+# ---------------------------------------------------------------- --self-test (offline)
+class FakeServer(Server):
+    """A Server whose replies come from a list; request() is the real one for raw replies."""
+    def __init__(self, replies):
+        Server.__init__(self, 1, "0" * 64)
+        self.replies = list(replies)
+
+    def request(self, method, path, body=None, timeout=120):
+        status, raw = self.replies.pop(0)
+        if isinstance(raw, bytes):
+            try:
+                return status, raw.decode("utf-8")
+            except UnicodeDecodeError:
+                return BAD_REPLY, "not UTF-8"
+        return status, raw
+
+
+def self_test():
+    """Offline checks: no server, no key file. Exit status 0 = all passed."""
+    global OPENER  # swapped for a stub once below, and put back
+    c = Checker()
+    # build_opener drops its default (environment) ProxyHandler because one is passed, and
+    # keeps the passed empty one out of the chain since it handles no scheme: so OPENER
+    # has no handler that proxies anything, and http/https go straight to HTTP(S)Handler.
+    def proxying(opener):
+        return [h for h in opener.handlers if isinstance(h, urllib.request.ProxyHandler) and h.proxies]
+
+    def openers_of(opener, scheme):
+        return [type(h).__name__ for h in opener.handle_open.get(scheme, [])]
+
+    c.check("OPENER has no ProxyHandler with proxies", proxying(OPENER) == [],
+            repr([h.proxies for h in proxying(OPENER)]))
+    for scheme, want in (("http", ["HTTPHandler"]), ("https", ["HTTPSHandler"])):
+        c.check("OPENER opens %s with %s only" % (scheme, want[0]), openers_of(OPENER, scheme) == want,
+                repr(openers_of(OPENER, scheme)))
+    names = Server.request.__code__.co_names
+    c.check("Server.request opens through OPENER, never urlopen", "OPENER" in names and "urlopen" not in names,
+            repr(names))
+    # With a proxy variable set: what the default would do, and that OPENER ignores it.
+    saved_env = {k: os.environ.get(k) for k in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY",
+                                                 "no_proxy", "NO_PROXY")}
+    try:
+        for k in saved_env:
+            os.environ.pop(k, None)
+        os.environ["http_proxy"] = "http://127.0.0.1:9"
+        c.check("with http_proxy set, the environment names a proxy for http",
+                urllib.request.getproxies().get("http") == "http://127.0.0.1:9", repr(urllib.request.getproxies()))
+        c.check("with http_proxy set, 127.0.0.1 is not bypassed by default",
+                not urllib.request.proxy_bypass("127.0.0.1"))
+        c.check("with http_proxy set, a default ProxyHandler would proxy http",
+                urllib.request.ProxyHandler().proxies.get("http") == "http://127.0.0.1:9")
+        default = urllib.request.build_opener()
+        c.check("with http_proxy set, the default opener (urlopen's) would proxy http",
+                "ProxyHandler" in openers_of(default, "http"), repr(openers_of(default, "http")))
+        same = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        c.check("with http_proxy set, an opener built like OPENER opens http with HTTPHandler only",
+                proxying(same) == [] and openers_of(same, "http") == ["HTTPHandler"], repr(openers_of(same, "http")))
+        c.check("with http_proxy set, OPENER opens http with HTTPHandler only",
+                proxying(OPENER) == [] and openers_of(OPENER, "http") == ["HTTPHandler"])
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    # Replies that cannot be used are counted FAILs (BAD_REPLY), never a traceback.
+    for label, reply in (("not JSON", (200, "<html>oops")),
+                         ("JSON without prompt", (200, '{"other": 1}')),
+                         ("prompt not a string", (200, '{"prompt": 7}')),
+                         ("JSON array", (200, '["prompt"]')),
+                         ("deeply nested JSON", (200, "[" * 100000 + "]" * 100000)),
+                         ("body not UTF-8", (200, b"\xff\xfe{\"prompt\": \"x\"}"))):
+        status, prompt, raw = FakeServer([reply]).render({"messages": []})
+        c.check("render: %s is BAD_REPLY" % label, status == BAD_REPLY and prompt is None, repr((status, raw[:80])))
+    status, prompt, _ = FakeServer([(200, '{"prompt": "ok"}')]).render({"messages": []})
+    c.check("render: a good reply passes", status == 200 and prompt == "ok")
+    # The real request(): a non-UTF-8 body becomes BAD_REPLY with a message without the key.
+    key = "ab" * 32
+
+    class Resp:
+        status = 200
+
+        def read(self):
+            return b"\xff\xfe"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class Op:
+        def open(self, req, timeout=None):
+            return Resp()
+
+    real = OPENER
+    OPENER = Op()
+    try:
+        status, text = Server(1, key).request("POST", "/apply-template", {"messages": []})
+    finally:
+        OPENER = real
+    c.check("request: a non-UTF-8 body is BAD_REPLY", status == BAD_REPLY, repr(status))
+    c.check("request: its message does not contain the key", key not in text and "Bearer" not in text, text)
+    # check_merged on bad replies counts FAILs and returns.
+    inner = Checker()
+    sys_stdout, sys.stdout = sys.stdout, open(os.devnull, "w")
+    try:
+        check_merged(inner, FakeServer([(200, "not json")]), "x", {"messages": []}, [S1])
+        same_render(inner, FakeServer([(200, b"\xff"), (200, '{"prompt": "p"}')]), "y", {}, {})
+        _, bad = render_baseline(FakeServer([(200, "nope")] * len(BASELINE)))
+    finally:
+        sys.stdout.close()
+        sys.stdout = sys_stdout
+    c.check("check_merged and same_render count bad replies as FAIL", inner.failed == 2, "failed %d" % inner.failed)
+    c.check("render_baseline reports each bad case", len(bad) == len(BASELINE), "%d of %d" % (len(bad), len(BASELINE)))
+    # The baseline directory.
+    with tempfile.TemporaryDirectory() as tmp:
+        missing = os.path.join(tmp, "nope", "b.json")
+        c.check("a missing baseline directory is reported", baseline_dir_problem(missing) is not None)
+        ro = os.path.join(tmp, "ro")
+        os.mkdir(ro, 0o500)
+        try:
+            if os.geteuid() != 0:
+                c.check("an unwritable baseline directory is reported",
+                        baseline_dir_problem(os.path.join(ro, "b.json")) is not None)
+                sys_stdout, sys.stdout = sys.stdout, open(os.devnull, "w")
+                try:
+                    ok = save_baseline(os.path.join(ro, "b.json"), {"a": "b"})
+                finally:
+                    sys.stdout.close()
+                    sys.stdout = sys_stdout
+                c.check("a failed baseline write returns False", ok is False)
+        finally:
+            os.chmod(ro, 0o700)
+        good = os.path.join(tmp, "b.json")
+        c.check("a writable baseline directory passes", baseline_dir_problem(good) is None)
+        c.check("save_baseline writes the file", save_baseline(good, {"a": "b"}) and load_baseline(good) == {"a": "b"})
+    print("PASS" if not c.failed else "FAIL: %d check(s) failed" % c.failed)
+    return 1 if c.failed else 0
 
 
 def main():
@@ -239,28 +522,60 @@ def main():
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--save-baseline", metavar="FILE")
     g.add_argument("--baseline", metavar="FILE")
+    g.add_argument("--self-test", action="store_true", help="offline checks only (no server, no key file)")
     args = ap.parse_args()
-    srv = Server(args.port or read_port())
+    if args.self_test:
+        return self_test()
+    if args.save_baseline:
+        why = baseline_dir_problem(args.save_baseline)
+        if why:
+            print("FAIL: cannot save the baseline to %s: %s" % (args.save_baseline, why))
+            return 1
+    saved = load_baseline(args.baseline) if args.baseline else None
+    port = valid_port(args.port if args.port is not None else read_port())
+    srv = Server(port, read_key())
 
+    c = Checker()
     status, raw = srv.request("GET", "/props")
+    tpl, why = None, "HTTP %s: %s" % (status, raw[:300])
     if status == 200:
-        tpl = json.loads(raw).get("chat_template", "")
+        try:
+            props = json.loads(raw)
+        except (ValueError, RecursionError):
+            props = None
+        if not isinstance(props, dict):
+            why = "HTTP 200 but the body is not a JSON object"
+        elif not isinstance(props.get("chat_template"), str):
+            why = "HTTP 200 but chat_template is missing or not a string"
+        else:
+            tpl = props["chat_template"]
+    if c.check("GET /props HTTP 200 with a chat_template string", tpl is not None, why):
         print("server chat template: %d chars, md5 %s" % (len(tpl), hashlib.md5(tpl.encode("utf-8")).hexdigest()))
 
     if args.save_baseline:
-        out = render_baseline(srv)
-        Path(args.save_baseline).write_text(json.dumps(out, indent=1, sort_keys=True) + "\n")
+        if c.failed:
+            print("FAIL: not saving a baseline: the server's chat template could not be identified")
+            return 1
+        out, bad = render_baseline(srv)
+        for name in sorted(bad):
+            c.check("baseline case " + name, False, bad[name])
+        if bad:
+            print("FAIL: not saving a baseline: %d case(s) did not render" % len(bad))
+            return 1
+        if not save_baseline(args.save_baseline, out):
+            return 1
         print("saved %d baseline renderings to %s" % (len(out), args.save_baseline))
         return 0
 
-    c = Checker()
     run_checks(c, srv)
     if args.baseline:
-        saved = json.loads(Path(args.baseline).read_text())
-        now = render_baseline(srv)
+        now, bad = render_baseline(srv)
         for name, _ in BASELINE:
             if name not in saved:
                 c.check("byte-for-byte " + name, False, "not in the baseline file")
+                continue
+            if name in bad:
+                c.check("byte-for-byte " + name, False, bad[name])
                 continue
             a, b = saved[name], now[name]
             at = next((i for i in range(min(len(a), len(b))) if a[i] != b[i]), min(len(a), len(b)))

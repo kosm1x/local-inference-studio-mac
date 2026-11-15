@@ -1,4 +1,9 @@
 # Model payloads are never committed (models/manifest.json and models/README.md are).
+# Everything under models/ is ignored except those two files; the extension lines below
+# are kept as a second statement of the same rule.
+models/**
+!models/manifest.json
+!models/README.md
 models/**/*.gguf
 models/**/*.safetensors
 models/**/*.bin

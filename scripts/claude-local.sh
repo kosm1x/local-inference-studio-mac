@@ -10,8 +10,8 @@
 # each may be given once). Everything else goes to claude in order, but only what the
 # pass-through allow-list below names (print mode and its formats, --no-session-
 # persistence, --continue, --resume, --name, --verbose, --permission-mode manual|acceptEdits|plan, --allowedTools/--disallowedTools,
-# the prompt); a `--` and the words after it go verbatim, and none of them may start with
-# '-':
+# --max-turns N, the prompt); a `--` and the words after it go verbatim, and none of them
+# may start with '-':
 #   --full             the full tool set: no --tools list, no policy text, user scope on;
 #                      MCP stays off (--strict-mcp-config with an empty config).
 #   --start-server     when GET /health is not ok, run scripts/serve.sh --detach (it
@@ -25,6 +25,15 @@
 #   --print-args       print the claude argument list and the settings JSON on stdout and
 #                      exit 0: no server contact, no key read, nothing written, claude not
 #                      started.
+#
+# Turn cap (a backstop for unattended runs: a headless run once repeated one refused Bash
+# call 219 times in 45 minutes; the hooks can refuse a call but cannot end the turn):
+# --max-turns N (N from 1 to 10000, digits only, no leading zero; once) goes to claude as
+# given. In print mode (-p/--print) without it, the launcher adds --max-turns 60 ahead of
+# the caller's arguments and says so on stderr; interactive sessions get none. The option
+# is hidden from `claude --help` of 2.1.325 but parsed (`--max-turns <turns>`, a non-number
+# refused) and enforced there: a print run that reaches the cap ends with the JSON result
+# subtype error_max_turns. It caps the number of turns, not the time one turn takes.
 #
 # Order (ledger: a server-starting launcher runs after every refusal and before any
 # per-start secret read, because serve.sh writes a new key at every start):
@@ -183,7 +192,9 @@ lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 # value, until this list is checked again. Everything else is refused by name: an option
 # not listed, --flag=value for a flag not listed, a short-option cluster (-pc), a first
 # operand that is a subcommand name, and any word starting with '-' after a bare `--`.
-PASS_LIST='-p/--print, --output-format text|json|stream-json, --input-format text|stream-json, --include-partial-messages, --no-session-persistence, -c/--continue, -r/--resume [id], -n/--name <name>, --verbose, --permission-mode manual|acceptEdits|plan, --allowedTools/--allowed-tools <tools...>, --disallowedTools/--disallowed-tools <tools...>, and the prompt'
+# --max-turns <turns> is not in that help text (hidden in 2.1.325) but is parsed and
+# enforced by that client; it is checked here as an integer from 1 to 10000, given once.
+PASS_LIST='-p/--print, --output-format text|json|stream-json, --input-format text|stream-json, --include-partial-messages, --no-session-persistence, -c/--continue, -r/--resume [id], -n/--name <name>, --verbose, --permission-mode manual|acceptEdits|plan, --allowedTools/--allowed-tools <tools...>, --disallowedTools/--disallowed-tools <tools...>, --max-turns <1-10000>, and the prompt'
 # Subcommand names and aliases of 2.1.322, plus Commander's implicit `help`.
 SUBCOMMANDS=' agents attach auth auto-mode doctor gateway help import install kill logs mcp plugin plugins purge respawn rm setup-token stop ultrareview update upgrade '
 # One tool rule: a capitalised tool name or an mcp__ name, with an optional (specifier)
@@ -211,6 +222,13 @@ tool_value() {    # $1 = option, $2 = one word of its value list
 resume_value() {    # $1 = value, $2 = option (default --resume)
     [[ $1 =~ $RESUME_RE ]] || die "${2:---resume} value '$1' is not a session id or name (letters, digits, '.', '_', '-')."
 }
+MAX_TURNS=; MAX_TURNS_DEFAULT=60; PRINT_MODE=0
+max_turns_value() {    # $1 = value: an integer from 1 to 10000, digits only, given once
+    [ -z "$MAX_TURNS" ] || twice --max-turns
+    [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && [ "$1" -le 10000 ] ||
+        die "--max-turns value '$1' is not an integer from 1 to 10000 ($PASS_LIST)."
+    MAX_TURNS=$1
+}
 operand=0
 first_operand() {
     [ "$operand" = 0 ] || return 0
@@ -237,8 +255,13 @@ while [ "$i" -lt "$n_args" ]; do
     fi
     case $a in
         --) after_dd=1 ;;
-        -p | --print | -c | --continue | --verbose | --include-partial-messages | \
-            --no-session-persistence) ;;
+        -p | --print) PRINT_MODE=1 ;;
+        -c | --continue | --verbose | --include-partial-messages | --no-session-persistence) ;;
+        --max-turns)    # <turns>: the next word whatever it is, validated
+            [ "$i" -lt "$n_args" ] || die "--max-turns needs a value (an integer from 1 to 10000)."
+            max_turns_value "${claude_args[$i]}"
+            i=$((i + 1)) ;;
+        --max-turns=*) max_turns_value "${a#*=}" ;;
         -n | --name)    # <name>: the next word whatever it is, validated as a resume id
             [ "$i" -lt "$n_args" ] || die "$a needs a value (a session name)."
             resume_value "${claude_args[$i]}" "$a"
@@ -595,6 +618,8 @@ STAMP=$(date +%Y%m%d-%H%M%S)
 # The lean arguments. --tools and --mcp-config take several values, so each is followed by
 # another option, never by the caller's arguments (also under --full, where the
 # reference puts --mcp-config last).
+# The default turn cap goes last in this block: after the multi-value options, before
+# the caller's arguments (so never after a caller's `--`).
 build_lean() {    # $1 = MCP config path
     if [ "$FULL" = 1 ]; then
         LEAN=(--mcp-config "$1" --strict-mcp-config)
@@ -604,7 +629,16 @@ build_lean() {    # $1 = MCP config path
     if [ "$FULL" = 0 ] && [ "$USER_SCOPE" = 0 ]; then
         LEAN=(--setting-sources project,local "${LEAN[@]}")
     fi
+    if [ "$ADD_MAX_TURNS" = 1 ]; then
+        LEAN+=(--max-turns "$MAX_TURNS_DEFAULT")
+    fi
 }
+ADD_MAX_TURNS=0
+TURNS_NOTE=
+if [ "$PRINT_MODE" = 1 ] && [ -z "$MAX_TURNS" ]; then
+    ADD_MAX_TURNS=1
+    TURNS_NOTE="print mode without --max-turns: added --max-turns $MAX_TURNS_DEFAULT (caps turns, not the time one turn takes)"
+fi
 if [ "$FULL" = 1 ]; then SCOPE_NOTE='on (--full)'
 elif [ "$USER_SCOPE" = 1 ]; then SCOPE_NOTE='on (--user-scope)'
 else SCOPE_NOTE='off (S-O3)'; fi
@@ -625,6 +659,7 @@ if [ "$PRINT_ARGS" = 1 ]; then
     copy_args "$run"
     say "print only: no server contact, no key read, nothing written, claude not started"
     say "user scope: $SCOPE_NOTE   guard: $GUARD_NOTE   context tokens: $CTX_TOKENS$CTX_NOTE"
+    [ -z "$TURNS_NOTE" ] || say "$TURNS_NOTE"
     printf '%s\n' 'claude arguments (JSON array, in order):'
     "$PY" -I -c 'import json, sys; print(json.dumps(sys.argv[1:], indent=2))' \
         --settings "$run/lis-settings-$$.json" "${LEAN[@]}" ${claude_args[@]+"${claude_args[@]}"} ||
@@ -728,6 +763,7 @@ build_lean "$MCP"
 say "hook copies: $RUN_REAL (read-only, kept after exit)"
 say "user scope: $SCOPE_NOTE"
 say "profile: none   guard: $GUARD_NOTE   context tokens: $CTX_TOKENS$CTX_NOTE"
+[ -z "$TURNS_NOTE" ] || say "$TURNS_NOTE"
 
 # ---------------------------------------------------------------- 6. env and launch
 # The inherited env was scrubbed at the top (the environment step); only the block is set.

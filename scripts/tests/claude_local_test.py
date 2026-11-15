@@ -20,7 +20,9 @@ removal at exit; every refusal starting nothing (no curl, no serve.sh, no claude
 dir); --full, --no-guard, --no-loop-guard, --strict-slot, --print-args; claude's exit
 code passed through. Also: the pass-through allow-list (each refused option named, a
 subcommand as the first operand, option words after `--`, every word of a multi-value
-list, --permission-mode choices, the allowed options passed unchanged); the working
+list, --permission-mode choices, the allowed options passed unchanged); the turn cap
+(--max-turns 1..10000 accepted once, other values refused, the default --max-turns 60
+added in print mode only, ahead of the caller's arguments, with a status line); the working
 directory's .claude/settings*.json refusals; the flag-level pins in the per-run settings;
 the run dir's digits-only name and a planted path never reused (stub `od` and `date`);
 the env scrub before serve.sh (its env recorded); an inherited SHELLOPTS=xtrace printing
@@ -364,7 +366,8 @@ def lean_run():
               and 'the context window is 131,072 tokens.' in pol and 'never spawn subagents' in pol
               and 'For a file over 300 lines' in pol and 'Measure-Object' not in pol
               and 'nvidia-smi' not in pol, 'lean: policy text')
-        check(a[11:] == ['-p', 'hello world', '--', 'and more'], f'lean: caller arguments last, in order: {a[11:]}')
+        check(a[11:13] == ['--max-turns', '60'], f'lean: print mode adds the default turn cap: {a[11:13]}')
+        check(a[13:] == ['-p', 'hello world', '--', 'and more'], f'lean: caller arguments last, in order: {a[13:]}')
         env = c['env']
         for k, v in WANT_ENV.items():
             check(env.get(k) == v, f'lean: env {k}={env.get(k)!r}, want {v!r}')
@@ -711,7 +714,6 @@ ALLOW_REFUSALS = [
     (['--debug'], ['--debug']),
     (['-d'], ["'-d'"]),
     (['--debug-file', 'f.log'], ['--debug-file']),
-    (['--max-turns', '3'], ['--max-turns']),
     (['--model', 'opus'], ['--model']),
     (['--model=opus'], ['--model']),
     (['--system-prompt', 's'], ['--system-prompt']),
@@ -758,6 +760,95 @@ ALLOW_REFUSALS = [
     (['-n', '-p', 'x'], ["-n value '-p'"]),
     (['--no-session-persistence=1'], ['--no-session-persistence']),
 ]
+
+
+# The turn cap: refused values, each with --start-server and the server down.
+MAX_TURNS_REFUSALS = [
+    (['--max-turns', '0', '-p', 'x'], ["--max-turns value '0'"]),
+    (['--max-turns', '10001', '-p', 'x'], ["--max-turns value '10001'"]),
+    (['--max-turns', '-1', '-p', 'x'], ["--max-turns value '-1'"]),
+    (['--max-turns', '+5', '-p', 'x'], ["--max-turns value '+5'"]),
+    (['--max-turns', '1.5', '-p', 'x'], ["--max-turns value '1.5'"]),
+    (['--max-turns', '', '-p', 'x'], ["--max-turns value ''"]),
+    (['--max-turns=', '-p', 'x'], ["--max-turns value ''"]),
+    (['--max-turns', '05', '-p', 'x'], ["--max-turns value '05'"]),
+    (['--max-turns', ' 5', '-p', 'x'], ["--max-turns value ' 5'"]),
+    (['--max-turns', '99999999999', '-p', 'x'], ["--max-turns value '99999999999'"]),
+    (['--max-turns=abc', '-p', 'x'], ["--max-turns value 'abc'"]),
+    (['-p', 'x', '--max-turns'], ['--max-turns needs a value']),
+    (['--max-turns', '3', '-p', 'x', '--max-turns', '4'], ['--max-turns was given more than once']),
+    (['--max-turns=3', '--max-turns', '3', '-p', 'x'], ['--max-turns was given more than once']),
+    (['-p', 'x', '--', '--max-turns', '5'], ["'--max-turns' after '--'"]),
+    (['--MAX-TURNS', '5', '-p', 'x'], ['--MAX-TURNS']),
+]
+TURNS_LINE = 'claude-local: print mode without --max-turns: added --max-turns 60'
+
+
+def max_turns():
+    for args, names in MAX_TURNS_REFUSALS:
+        e = Env()
+        try:
+            r = e.run('--start-server', *args)
+            refused_quietly(e, r, f'max-turns refuses {args}', names)
+        finally:
+            e.close()
+
+    def launched(args):
+        e = Env()
+        try:
+            e.up()
+            r = e.run(*args)
+            cl = [c for c in e.calls() if c['who'] == 'claude']
+            check(r.returncode == 0 and len(cl) == 1, f'max-turns {args}: launches: rc {r.returncode} {r.stderr[-200:]!r}')
+            return r, (cl[0]['argv'] if cl else [])
+        finally:
+            e.close()
+
+    # accepted values, passed unchanged at the caller's position, no default, no status line
+    for args in (['-p', 'x', '--max-turns', '1'], ['--max-turns', '60', '-p', 'x'],
+                 ['-p', '--max-turns', '10000', 'x'], ['--max-turns=9999', '--print', 'x'],
+                 ['--max-turns', '5', 'x']):
+        r, a = launched(args)
+        check(a[-len(args):] == args, f'max-turns {args}: passed in place: {a[-len(args):]}')
+        check(sum(1 for w in a if w == '--max-turns' or w.startswith('--max-turns=')) == 1,
+              f'max-turns {args}: one --max-turns only (an explicit value replaces the default): {a}')
+        check(TURNS_LINE not in r.stderr, f'max-turns {args}: no default status line')
+    # print mode without it: the default, ahead of the prompt and of a `--`, with the line
+    for args in (['-p', 'hello', '--', 'more'], ['--print', 'x'], ['--full', '-p', 'x'],
+                 ['--output-format', 'json', '-p', 'x'], ['--allowedTools', 'Bash', 'Read', '-p', '--', 'y']):
+        r, a = launched(args)
+        want = [w for w in args if w != '--full']
+        if not check('--max-turns' in a, f'max-turns default {args}: added: {a}'):
+            continue
+        k = a.index('--max-turns')
+        check(a[k + 1] == '60' and a.count('--max-turns') == 1, f'max-turns default {args}: --max-turns 60 once')
+        check(a[k + 2:] == want, f'max-turns default {args}: right before the caller arguments: {a[k:]}')
+        check(k < a.index('--print' if '--print' in a else '-p'), f'max-turns default {args}: before the prompt')
+        if '--' in a:
+            check(k < a.index('--') and '--max-turns' not in a[a.index('--'):],
+                  f'max-turns default {args}: before the --, not after it')
+        check(TURNS_LINE in r.stderr and '(caps turns, not the time one turn takes)' in r.stderr,
+              f'max-turns default {args}: status line: {r.stderr[-300:]!r}')
+    # interactive: nothing added, no line
+    for args in (['fix it'], ['--verbose', '--', 'x'], ['--full', 'x'], []):
+        r, a = launched(args)
+        check(not any(w.startswith('--max-turns') for w in a), f'max-turns interactive {args}: none added: {a}')
+        check(TURNS_LINE not in r.stderr, f'max-turns interactive {args}: no status line')
+    # --print-args shows it (no server needed)
+    for args, want, line in ((['-p', 'x'], '60', True), (['-p', 'x', '--max-turns', '5'], '5', False),
+                             (['x'], None, False)):
+        e = Env()
+        try:
+            r = e.run('--print-args', *args)
+            arr = json.loads(r.stdout.split('claude arguments (JSON array, in order):\n', 1)[1]
+                             .split('settings JSON', 1)[0])
+            got = arr[arr.index('--max-turns') + 1] if '--max-turns' in arr else None
+            check(r.returncode == 0 and got == want and arr.count('--max-turns') == (0 if want is None else 1),
+                  f'--print-args {args}: --max-turns {got!r}, want {want!r}')
+            check((TURNS_LINE in r.stderr) == line, f'--print-args {args}: status line {line}')
+            check(not e.calls() and not e.run_dirs(), f'--print-args {args}: nothing started')
+        finally:
+            e.close()
 
 
 def allow_list():
@@ -1001,7 +1092,8 @@ def syntax():
 def main():
     global N, FAILS
     for group in (syntax, static_order, lean_run, full_run, scope_and_guards, start_server,
-                  preflight, print_args, refusals, allow_list, project_settings, run_dir, tools):
+                  preflight, print_args, refusals, allow_list, max_turns, project_settings, run_dir,
+                  tools):
         try:
             group()
         except Exception as ex:     # a missing record (claude never ran) fails the group

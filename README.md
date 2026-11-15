@@ -1,0 +1,197 @@
+# local-inference-studio-mac
+
+Claude Code run against a local model on an Apple silicon MacBook: llama.cpp
+`llama-server` from Homebrew serves the Anthropic Messages API (`/v1/messages`) on
+127.0.0.1, and `scripts/claude-local.sh` points the Claude Code CLI at it. No Ollama, no
+LM Studio, no proxy, no cloud model.
+
+This is a macOS port of the Windows repo `local-inference-studio` (RTX 4070 Ti SUPER,
+PowerShell), called "the reference" below. Only the server, launcher, guard hooks, smoke
+test and bench were ported; the reference's container, web tools, logon task and task
+profiles were not. Setup from scratch: [docs/SETUP.md](docs/SETUP.md).
+
+## Verified on (2026-11-14)
+
+| Component | Value |
+|---|---|
+| Machine | MacBook Air, Apple M4 (10 cores), 32 GB unified memory |
+| OS | macOS 26.5.2 |
+| Server | llama-server 1.0.0 (build 12359, commit b1b770d90), Homebrew `llama.cpp` |
+| Python | 3.13.18, Homebrew `python@3.13` (`/opt/homebrew/bin/python3.13`) |
+| Client | Claude Code 2.1.325 |
+
+Anything not run on this machine is marked UNVERIFIED.
+
+```
+Claude Code CLI   scripts/claude-local.sh: lean tool set, no MCP, guard hooks,
+   |              user settings off, one-model policy appended
+   | ANTHROPIC_BASE_URL=http://127.0.0.1:8080, every model alias = "local"
+   v
+llama-server      scripts/serve.sh: 127.0.0.1 only, fresh API key per start,
+   |              --offline, allow-listed extra flags
+   v
+GGUF model        models/<dir>/<file>.gguf, size and sha256 pinned in models/manifest.json
+```
+
+## Quick start
+
+From the repo root, with a model already downloaded and listed (docs/SETUP.md):
+
+```bash
+scripts/serve.sh --dry-run            # print the llama-server command line; starts nothing
+scripts/serve.sh --detach --wait 300  # start in the background; returns once /health is 200
+scripts/smoke.sh                      # health, text, tool_use, tool_result round trip
+(cd <project> && <repo>/scripts/claude-local.sh)  # Claude Code on the local server
+scripts/stop.sh                       # stop the server recorded in logs/llama-server.pid
+```
+
+- `serve.sh` without `--detach` runs llama-server in the foreground; Ctrl-C stops it.
+- `smoke.sh` ends with `PASS: health, text, tool_use and tool_result round trip`.
+- `claude-local.sh --start-server` starts the server first when `/health` is not ok.
+  `claude-local.sh --print-args` prints the claude arguments and the settings JSON and
+  exits without contacting the server or reading the key.
+- Claude Code runs in the directory you start it from (the project); the launcher finds
+  the server, key and hooks from its own location.
+- Before a serve or a bench, check the machine: swap in use (`sysctl vm.swapusage`),
+  memory free (`serve.sh` logs `memory free: <N> MiB available` at every start), Low
+  Power Mode off (`pmset -g`), other large apps closed.
+
+## Models
+
+Both files are in `models/manifest.json` (repo, revision, file, byte size, sha256).
+
+| `MODEL_ID` | File | Size | KV | Reasoning | Chat template |
+|---|---|---|---|---|---|
+| `qwen3.6-35b-a3b-heretic-iq3m` (default) | Qwen3.6-35B-A3B uncensored heretic, i1-IQ3_M (MoE) | 15.44 GB | f16, `--swa-full` | auto | `config/chat-templates/qwen3.6-35b-a3b.jinja` (patched) |
+| `qwen3.8-27b-orcarouter-iq3xxs` | Qwen3.8-27B OrcaRouter GSQ-RCO IQ3_XXS v2.1 (dense 27B) | 10.38 GB | q4_0 | off | `config/chat-templates/qwen3.8-27b.jinja` (the reference's patched template) |
+
+- Use the default for real work: about 7x the decode speed and 7x the prefill speed of
+  the 27B on this machine (table below).
+- The 27B is the reference's default model. It is kept for like-for-like comparison
+  with the Windows numbers, not for daily use here: a 20,000-token prompt takes over nine
+  minutes to prefill.
+- Claude Code needs a template that accepts a system message after the first one. With
+  its GGUF's embedded template the default model failed the first Claude Code turn with
+  HTTP 500 "System message must be at the beginning."; the patched template fixed it. The
+  27B's own embedded template was never tried here (UNVERIFIED); the reference documents
+  the same failure for another Qwen3.8-27B file and ships the patch used here.
+
+## Measured numbers
+
+`bench/run.sh` at context 131072: decode = median of 3 runs of 256 tokens on a 200-token
+prompt after one discarded warm-up; prefill = median of 3 cold 20,000-token prompts;
+cached = the same prompt again with the prefix cache hit; tools = 20 `/v1/messages`
+trials that each need one tool. Logs and JSON are in `bench/results/` (gitignored, kept
+on this machine). Both models were benched on 2026-11-14 with a browser open and on AC
+power.
+
+| Model, reasoning | Decode tok/s | Prefill 20K | Cached | Tools | Tool p50 | Mem used peak | Server RSS peak |
+|---|---|---|---|---|---|---|---|
+| default, off | 37.88 | 75.6 s (264.6 tok/s) | 91 ms | 14/20 | 1,127 ms | 27,256 MiB | 18,646 MiB |
+| default, auto | 37.49 | 76.1 s (262.7 tok/s) | 79 ms | 19/20 | 6,847 ms | 27,101 MiB | 19,365 MiB |
+| 27B, off | 5.39 | 556.5 s (35.9 tok/s) | 412 ms | 20/20 | 6,484 ms | 24,103 MiB | 15,679 MiB |
+
+- Default, reasoning off: the 6 misses answered without calling the tool. With reasoning
+  auto the one miss thought for 136 s until it hit max_tokens. Hence `reasoning: auto`
+  for this model and `off` for the 27B.
+- The default-model benches ran on the GGUF's embedded template, before the patched
+  one existed (their `flags` show no `--chat-template-file`). The bench requests hold at
+  most one system message, and the commit that added the patch records that 20
+  single-system cases render identically under both.
+- "Mem used" is wired + active + compressed pages from `vm_stat`; there is no separate
+  VRAM figure on unified memory. Whether it measures fit for Metal buffers is UNVERIFIED.
+- The reference reports for the 27B on its RTX 4070 Ti SUPER 16 GB: decode 48.6 tok/s,
+  20K prefill 11.8 s (1,697 tok/s), tools 20/20 (the reference's `config/models.md`; not
+  measured here).
+- Decode falls with context depth. From one session's server log (default model,
+  reasoning auto, 2026-11-14; not a bench): 37.5 tok/s near empty, 31.9 at 11K tokens,
+  21.2 at 28K, 13.9 at 50K, 9.9 at 71K. The bench figure is the top of that curve.
+
+## Switching models
+
+`MODEL_ID` in `config/lis.conf` is the only line to change. Everything that differs by
+model lives in its `models/manifest.json` entry and follows `MODEL_ID`:
+
+- `kv_type` (overrides `KV_TYPE`), `sampling` (`temp`, `top_p`, `top_k`; defaults 0.6,
+  0.95, 20), `server_args` (extra llama-server flags, allow-listed), `reasoning`
+  (`off`/`on`/`auto`; `serve.sh --reasoning ...` overrides it for one start),
+  `chat_template` (replaces `CHAT_TEMPLATE`).
+
+```bash
+scripts/stop.sh
+# edit config/lis.conf: MODEL_ID=qwen3.8-27b-orcarouter-iq3xxs
+scripts/serve.sh --dry-run      # check -ctk/-ctv, --reasoning and --chat-template-file
+scripts/serve.sh --detach --wait 300
+scripts/smoke.sh
+```
+
+`config/lis.conf` is parsed, never sourced. `CTX=131072` is the server context;
+`CLIENT_CTX=114688` is the window Claude Code is told about (kept below `CTX`). The
+first start after each boot hashes the model file and refuses on a size or sha256
+mismatch. The field rules and the extra-flag allow-list are in
+[models/README.md](models/README.md).
+
+## Layout
+
+| Path | What |
+|---|---|
+| `scripts/serve.sh` | start llama-server (`--detach`, `--dry-run`, `--wait N`, `--reasoning`, `-- EXTRA_ARGS`) |
+| `scripts/stop.sh` | stop the one recorded server pid (SIGTERM, up to 30 s, no escalation) |
+| `scripts/smoke.sh` | 4-step smoke test against the running server |
+| `scripts/claude-local.sh` | launch Claude Code against the server (see its header for every option) |
+| `scripts/hooks/` | guard hooks: `lis-guard.py`, `loop-guard.py`, `repeat-guard.py`, `facts-inject.py` (not registered in this port) |
+| `scripts/tests/` | test suites, plus `chat_template_check.py` (needs a running server) |
+| `bench/run.sh` | bench the running server; writes JSON and a tee'd log to `bench/results/` |
+| `config/lis.conf` | `PORT`, `CTX`, `CLIENT_CTX`, `KV_TYPE`, `MODEL_ID`, `CHAT_TEMPLATE` |
+| `config/claude-settings.json` | the `--settings` overlay: model `local`, allow/ask/deny rules |
+| `config/chat-templates/` | the two patched templates, each with a header saying what changed |
+| `models/manifest.json`, `models/README.md` | the servable files and the per-model fields |
+| `logs/` (gitignored) | per-start API key, server logs, pid file, lock, hash marker |
+
+## Tests
+
+Run from the repo root:
+
+```bash
+/opt/homebrew/bin/python3.13 scripts/tests/serve_test.py         # about 2 minutes; ends "OK" (78 tests)
+/opt/homebrew/bin/python3.13 scripts/tests/stop_test.py          # ends "OK" (20 tests)
+/opt/homebrew/bin/python3.13 scripts/tests/claude_local_test.py  # ends "646/646 passed"
+```
+
+The hook suites (`scripts/hooks/tests/*_test.py`) and the template check are listed in
+[CLAUDE.md](CLAUDE.md). With a server running on the model to check:
+
+```bash
+/opt/homebrew/bin/python3.13 -I scripts/tests/chat_template_check.py   # last line "PASS"
+```
+
+## Known limits
+
+- A command refused by the guard and repeated by the model is bounded only by a turn
+  cap. The first working session sent one refused `python3 -c` command 219 times in a
+  row until it was stopped by hand: the guards denied every repeat, but a deny is text
+  only and does not end the turn (diagnosis in AGENT_LEARNINGS.md, 2026-11-14). In
+  print mode the launcher now adds `--max-turns 60` unless you pass `--max-turns N`
+  (1 to 10000); the run then ends with result subtype `error_max_turns` (checked on
+  2026-11-14 with `--max-turns 2`; result JSON saved as
+  `bench/results/20261114-max-turns-2-live.json`, gitignored like the other logs). Interactive sessions get no cap. A turn cap does not
+  bound the time one turn takes (a long generation or a slow command), so still watch a
+  headless run's wall time.
+- Thinking runaways are not capped: `--reasoning-budget` is not on `serve.sh`'s
+  allow-list.
+- Print mode (`-p`) cannot answer a permission prompt: a command that needs approval
+  comes back "This command requires approval". Pre-approve the test command or run the
+  session interactively (pre-approval not yet tried, UNVERIFIED). The guard also refuses inline `python3 -c` and running a file
+  written in the same session.
+- UNVERIFIED on this client: that the `--settings` file outranks the project's
+  `.claude/settings*.json` (the launcher refuses risky project files instead);
+  `--permission-mode manual`; compaction with reasoning on.
+- The hooks predate the reference's later guard changes (its audit ledger rows W-25 and
+  W-19).
+- One server, one slot (`-np 1`). The launcher warns when the slot is busy
+  (`--strict-slot` refuses instead).
+
+## Rules
+
+Agent rules are in [CLAUDE.md](CLAUDE.md). In short: no Ollama or LM Studio; models and
+binaries are never committed; scripts never pipe to a shell; the repo is local only.
