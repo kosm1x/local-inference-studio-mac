@@ -54,6 +54,11 @@ the reference checkout, where present, is read-only).
 - `ps -o comm=` follows argv[0]: a name check, not an identity check (`stop.sh` also
   compares `lsof`'s first `txt` entry with the installed binary).
 - `/tmp` and `/var` are links to `/private/...`.
+- Sessions started by `scripts/claude-local.sh` run their Bash tool in `/bin/bash`, not
+  the login zsh: the launcher pins `CLAUDE_CODE_SHELL=/bin/bash` and `SHELL=/bin/bash`
+  (process env and `--settings` file), because `lis-guard.py` models bash syntax only.
+  `~/.zshrc` aliases and functions are not applied there (`~/.bashrc` is, if present).
+  UNVERIFIED on client 2.1.325 until a live session shows `$BASH_VERSION`.
 - Python is `/opt/homebrew/bin/python3.13`, run with `-I` for anything that reads
   untrusted input.
 - Text with quotes or backslashes goes through the Write tool, not a Bash heredoc or

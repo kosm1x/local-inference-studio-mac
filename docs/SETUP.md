@@ -195,6 +195,16 @@ From the project directory you want to work in:
 - The launcher prints `user scope: off`, `guard: on` and `context tokens: 114688` on
   stderr. The client then printed `[claude-code:unrecognized_model]` and a note that
   claude.ai connectors are disabled; both appeared in the working session too.
+- The launcher also prints `session shell: /bin/bash (pinned as CLAUDE_CODE_SHELL and
+  SHELL)` (added after that session). The session's Bash tool runs `/bin/bash` 3.2
+  rather than your login zsh, because the guard hook reads commands as bash syntax: the
+  aliases, functions and options of `~/.zshrc` are not applied to tool commands, and per
+  Claude Code's documentation `~/.bashrc` is sourced instead if present. The launcher
+  refuses to start if `/bin/bash` is missing, not an executable regular file, or owned
+  by anyone but root and you or writable by everyone, and removes an inherited
+  `CLAUDE_CODE_SHELL_PREFIX` or `CLAUDE_ENV_FILE`. The pin is UNVERIFIED on 2.1.325: in
+  the first session after this change, ask for `echo "$BASH_VERSION"` and expect
+  `3.2.57(1)-release`.
 - In print mode (`-p`) nobody can answer a permission prompt: a command that needs one
   comes back "This command requires approval". The first working session (237 requests,
   per the commit that added the patched template) fixed its fixture bug correctly but
@@ -237,3 +247,5 @@ with `pkill`, `killall` or a computed kill.
 | `-p` session: "This command requires approval" | Print mode cannot answer prompts; pre-approve the command or run interactively. |
 | The model repeats one refused command | Known limit. A print-mode run stops at its turn cap (`--max-turns`, default 60); an interactive one must be stopped by hand. |
 | Replies slow down as a session grows | Expected: decode falls with context depth (README). |
+| `claude-local: bash (the session shell) ...` | `/bin/bash` failed the launcher's tool check (missing, not an executable file, foreign owner or writable by everyone). The launcher uses that fixed path only, never a Homebrew bash or `PATH`. |
+| An alias or function from `~/.zshrc` is missing in a session | Expected: sessions run `/bin/bash`, not zsh (step 10). Put what tool commands need in `~/.bashrc`, or call the program by name. |

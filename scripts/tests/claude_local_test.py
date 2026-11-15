@@ -28,7 +28,13 @@ the run dir's digits-only name and a planted path never reused (stub `od` and `d
 the env scrub before serve.sh (its env recorded); an inherited SHELLOPTS=xtrace printing
 no key; the tool trust checks (world-writable, foreign owner) and the test-only override
 LIS_TEST_CLIENT_BIN (python3.13, curl and claude come from the stub bin dir through it;
-it is announced on stderr and reaches neither serve.sh nor claude). W-19: no curl upload
+it is announced on stderr and reaches neither serve.sh nor claude). The session shell:
+CLAUDE_CODE_SHELL and SHELL are /bin/bash in claude's env and in the --settings file
+whatever the caller held (zsh, a missing path, empty), the caller's
+CLAUDE_CODE_SHELL_PREFIX and CLAUDE_ENV_FILE are cleared, a project file naming any of the
+four refuses, the status line names the shell, and the /bin/bash check refuses a
+missing, non-executable, world-writable or relative path (swapped into the test copy).
+W-19: no curl upload
 deny in config/claude-settings.json (none re-spelled), the curl upload ask rows present, no
 allow row for curl, wget or any command, no allow row matching an upload, no deny and some
 ask row matching each loopback upload, and lis-guard denying the non-loopback ones.
@@ -95,6 +101,11 @@ POISON = {
     'BUN_INSTALL': '/nonexistent/poison-bun',
     'SSL_CERT_DIR': '/nonexistent/poison-certs',
     'CLAUDE_PID': '1',
+    # the session shell and what the client runs around or before a shell command (SHELL
+    # is not here: it is not scrubbed before serve.sh; session_shell() checks it)
+    'CLAUDE_CODE_SHELL': '/bin/zsh',
+    'CLAUDE_CODE_SHELL_PREFIX': '/nonexistent/poison-shell-prefix',
+    'CLAUDE_ENV_FILE': '/nonexistent/poison-env-file',
     # the server's test overrides: must not reach serve.sh --detach
     'LIS_TEST_LLAMA_SERVER': '/nonexistent/poison-llama-server',
     'LIS_TEST_LLAMA_EXE': '/nonexistent/poison-llama-exe',
@@ -115,7 +126,12 @@ WANT_ENV = {
     'DISABLE_PROMPT_CACHING': '1',
     'ENABLE_TOOL_SEARCH': 'false',
     'CLAUDE_CODE_ATTRIBUTION_HEADER': '0',
+    'CLAUDE_CODE_SHELL': '/bin/bash',
+    'SHELL': '/bin/bash',
 }
+SESSION_SHELL = '/bin/bash'
+SHELL_ENV = ('CLAUDE_CODE_SHELL', 'SHELL', 'CLAUDE_CODE_SHELL_PREFIX', 'CLAUDE_ENV_FILE')
+SHELL_LINE = 'claude-local: session shell: /bin/bash (pinned as CLAUDE_CODE_SHELL and SHELL)'
 START_RE = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z')
 
 N = 0
@@ -899,6 +915,21 @@ PROJECT_REFUSALS = [
      ['env.HTTPS_PROXY'], ['proxy.example.invalid']),
     ('settings.json', '{"env": {"no_proxy": "*"}}', ['env.no_proxy'], []),
     ('settings.json', '{"env": ["x"]}', ['key env is not an object'], []),
+    # the session shell and what the client runs around or before a shell command
+    ('settings.json', '{"env": {"CLAUDE_CODE_SHELL": "/bin/zsh"}}', ['env.CLAUDE_CODE_SHELL'], ['/bin/zsh']),
+    ('settings.local.json', '{"env": {"CLAUDE_CODE_SHELL": "/bin/zsh"}}', ['env.CLAUDE_CODE_SHELL'], ['/bin/zsh']),
+    ('settings.json', '{"env": {"SHELL": "/bin/zsh"}}', ['env.SHELL'], ['/bin/zsh']),
+    ('settings.local.json', '{"env": {"SHELL": "/bin/zsh"}}', ['env.SHELL'], ['/bin/zsh']),
+    ('settings.json', '{"env": {"shell": "/bin/zsh"}}', ['env.shell'], ['/bin/zsh']),
+    ('settings.json', '{"env": {"CLAUDE_CODE_SHELL_PREFIX": "/x/wrap-cmd"}}',
+     ['env.CLAUDE_CODE_SHELL_PREFIX'], ['/x/wrap-cmd']),
+    ('settings.local.json', '{"env": {"CLAUDE_CODE_SHELL_PREFIX": "/x/wrap-cmd"}}',
+     ['env.CLAUDE_CODE_SHELL_PREFIX'], ['/x/wrap-cmd']),
+    ('settings.json', '{"env": {"CLAUDE_ENV_FILE": "/x/env-script.sh"}}', ['env.CLAUDE_ENV_FILE'], ['/x/env-script.sh']),
+    ('settings.local.json', '{"env": {"CLAUDE_ENV_FILE": "/x/env-script.sh"}}',
+     ['env.CLAUDE_ENV_FILE'], ['/x/env-script.sh']),
+    ('settings.json', '{"env": {"FOO": "1", "SHELL": "/bin/bash", "CLAUDE_ENV_FILE": "/x/e"}}',
+     ['env.SHELL', 'env.CLAUDE_ENV_FILE'], []),
     ('settings.json', '{ not json', ['.claude/settings.json: cannot be read as JSON'], []),
     ('settings.local.json', '[]', ['.claude/settings.local.json: the top level is not an object'], []),
 ]
@@ -944,6 +975,89 @@ def project_settings():
               f'project settings without those keys launch: {r.stderr[-200:]!r}')
     finally:
         e.close()
+
+
+def session_shell():
+    """The session shell: /bin/bash in claude's env and the settings, whatever the caller holds."""
+    # caller values: (CLAUDE_CODE_SHELL, SHELL), None = unset; the prefix and env file always set
+    callers = [(None, None), ('/bin/zsh', '/bin/zsh'), ('/nonexistent/sh', '/nonexistent/sh'), ('', ''),
+               (None, '/bin/zsh'), ('/bin/zsh', None), ('/bin/sh', '/usr/local/bin/fish')]
+    for ccs, sh in callers:
+        for mode in ((), ('--full',), ('--user-scope',)):
+            e = Env()
+            try:
+                e.up()
+                for k, v in (('CLAUDE_CODE_SHELL', ccs), ('SHELL', sh)):
+                    e.env.pop(k, None)
+                    if v is not None:
+                        e.env[k] = v
+                e.env['CLAUDE_CODE_SHELL_PREFIX'] = '/nonexistent/caller-prefix'
+                e.env['CLAUDE_ENV_FILE'] = '/nonexistent/caller-env-file'
+                r = e.run(*mode, '-p', 'x')
+                label = f'session shell, caller CLAUDE_CODE_SHELL={ccs!r} SHELL={sh!r} {list(mode)}'
+                cl = [c for c in e.calls() if c['who'] == 'claude']
+                if not check(r.returncode == 0 and len(cl) == 1, f'{label}: launches: rc {r.returncode} {r.stderr[-200:]!r}'):
+                    continue
+                env = cl[0]['env']
+                check(env.get('CLAUDE_CODE_SHELL') == SESSION_SHELL,
+                      f'{label}: claude gets CLAUDE_CODE_SHELL={env.get("CLAUDE_CODE_SHELL")!r}')
+                check(env.get('SHELL') == SESSION_SHELL, f'{label}: claude gets SHELL={env.get("SHELL")!r}')
+                check('CLAUDE_CODE_SHELL_PREFIX' not in env, f'{label}: the caller CLAUDE_CODE_SHELL_PREFIX is cleared')
+                check('CLAUDE_ENV_FILE' not in env, f'{label}: the caller CLAUDE_ENV_FILE is cleared')
+                s_env = cl[0]['settings'].get('env', {})
+                check(s_env.get('CLAUDE_CODE_SHELL') == SESSION_SHELL and s_env.get('SHELL') == SESSION_SHELL,
+                      f'{label}: the --settings file pins env.CLAUDE_CODE_SHELL and env.SHELL: '
+                      f'{s_env.get("CLAUDE_CODE_SHELL")!r} {s_env.get("SHELL")!r}')
+                check('CLAUDE_CODE_SHELL_PREFIX' not in s_env and 'CLAUDE_ENV_FILE' not in s_env,
+                      f'{label}: no prefix or env file in the --settings file')
+                check(SHELL_LINE in r.stderr.splitlines(), f'{label}: status line names the session shell')
+            finally:
+                e.close()
+    # --print-args: the settings JSON carries the pin, and the status line is printed
+    e = Env()
+    try:
+        e.env['SHELL'] = '/bin/zsh'
+        r = e.run('--print-args', '-p', 'x')
+        s = json.loads(r.stdout.split('settings JSON (the --settings file):\n', 1)[1]
+                       .split('MCP config JSON', 1)[0]) if 'settings JSON (the --settings file):\n' in r.stdout else {}
+        check(r.returncode == 0 and s.get('env', {}).get('CLAUDE_CODE_SHELL') == SESSION_SHELL
+              and s['env'].get('SHELL') == SESSION_SHELL, f'--print-args: settings pin the session shell: {r.stderr[-200:]!r}')
+        check(SHELL_LINE in r.stderr.splitlines(), '--print-args: status line names the session shell')
+    finally:
+        e.close()
+    # the fixed path, checked like the other tools: no PATH lookup, no Homebrew bash
+    with open(SCRIPT, encoding='utf-8') as f:
+        src = f.read()
+    check(src.count('\nSESSION_SHELL=/bin/bash\n') == 1 and "check_tool 'bash (the session shell)' \"$SESSION_SHELL\"" in src
+          and 'command -v bash' not in src and '/opt/homebrew/bin/bash' not in src,
+          'session shell: the fixed path /bin/bash, through check_tool')
+    check('export CLAUDE_CODE_SHELL="$SESSION_SHELL"' in src and 'export SHELL="$SESSION_SHELL"' in src,
+          'session shell: exported in the launch block')
+    # the check itself, on the test copy with the fixed path swapped (nothing starts)
+    def swapped(setup, label, names):
+        e = Env()
+        try:
+            p = os.path.join(e.repo, 'scripts', 'claude-local.sh')
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+            if not check(text.count('\nSESSION_SHELL=/bin/bash\n') == 1, f'{label}: SESSION_SHELL line in the copy'):
+                return
+            target = setup(e)
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write(text.replace('\nSESSION_SHELL=/bin/bash\n', f'\nSESSION_SHELL={target}\n'))
+            r = e.run('--start-server', '-p', 'x')
+            refused_quietly(e, r, label, names)
+        finally:
+            e.close()
+    swapped(lambda e: os.path.join(e.t, 'nowhere', 'bash'), 'session shell missing',
+            ['bash (the session shell)', 'not an executable file'])
+    swapped(lambda e: e.write('bin/noexec-bash', '#!/bin/sh\n', 0o644), 'session shell not executable',
+            ['bash (the session shell)', 'not an executable file'])
+    swapped(lambda e: os.path.join(e.t, 'bin'), 'session shell a directory',
+            ['bash (the session shell)', 'not an executable file'])
+    swapped(lambda e: e.write('bin/ww-bash', '#!/bin/sh\n', 0o757), 'session shell world-writable',
+            ['bash (the session shell) refused', 'writable by everyone'])
+    swapped(lambda e: 'bash', 'session shell relative', ['bash (the session shell)', 'not an absolute path'])
 
 
 FIXED_STAMP = '20260101-000000'
@@ -1186,7 +1300,7 @@ def syntax():
 def main():
     global N, FAILS
     for group in (syntax, static_order, lean_run, full_run, scope_and_guards, start_server,
-                  preflight, print_args, refusals, allow_list, max_turns, project_settings, run_dir,
+                  preflight, print_args, refusals, allow_list, max_turns, project_settings, session_shell, run_dir,
                   tools, settings_rules):
         try:
             group()

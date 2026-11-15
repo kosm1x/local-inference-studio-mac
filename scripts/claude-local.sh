@@ -57,18 +57,23 @@
 # CLAUDE_CODE_MAX_CONTEXT_TOKENS and CLAUDE_CODE_AUTO_COMPACT_WINDOW=<context tokens>,
 # CLAUDE_CODE_MAX_OUTPUT_TOKENS=16384, API_TIMEOUT_MS=1800000,
 # CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1,
-# DISABLE_PROMPT_CACHING=1, ENABLE_TOOL_SEARCH=false, CLAUDE_CODE_ATTRIBUTION_HEADER=0 and
-# LIS_SESSION_START (ISO 8601 UTC, 6 fraction digits). Removed from the inherited env at
+# DISABLE_PROMPT_CACHING=1, ENABLE_TOOL_SEARCH=false, CLAUDE_CODE_ATTRIBUTION_HEADER=0,
+# LIS_SESSION_START (ISO 8601 UTC, 6 fraction digits), and CLAUDE_CODE_SHELL=/bin/bash
+# and SHELL=/bin/bash (the session shell: the Bash tool runs bash, the syntax lis-guard
+# models, not the zsh of $SHELL; UNVERIFIED on 2.1.325 until a live session shows
+# $BASH_VERSION). Removed from the inherited env at
 # the very top, before serve.sh or anything else runs (the environment step lists them):
 # every inherited ANTHROPIC_*, CLAUDE_CODE_* and LIS_* variable (ANTHROPIC_API_KEY,
 # CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CODE_SUBAGENT_MODEL(_FORCE), CLAUDE_CODE_USE_BEDROCK/
-# VERTEX/FOUNDRY, ANTHROPIC_CUSTOM_HEADERS, LIS_RELAUNCH(_RC), LIS_TEST_* among them),
+# VERTEX/FOUNDRY, ANTHROPIC_CUSTOM_HEADERS, CLAUDE_CODE_SHELL(_PREFIX), LIS_RELAUNCH(_RC),
+# LIS_TEST_* among them), CLAUDE_ENV_FILE,
 # credentials and routing, proxies, node/bun code loading and TLS trust overrides, shell
 # and Python start-up files, DYLD_*, another config dir and parent-session markers; an
 # inherited SHELLOPTS is switched off (set +xv) and unexported. The process env
 # then points claude at the loopback server only; settings files can still set env
-# (the per-run file pins ANTHROPIC_BASE_URL to the same loopback URL, and a project file
-# that sets ANTHROPIC_*, CLAUDE_CODE_* or a proxy variable refuses the launch), and
+# (the per-run file pins ANTHROPIC_BASE_URL to the same loopback URL and the session
+# shell, and a project file that sets ANTHROPIC_*, CLAUDE_CODE_*, SHELL, CLAUDE_ENV_FILE
+# or a proxy variable refuses the launch), and
 # whether a flag-level value beats a project one is UNVERIFIED (see below). The key is
 # never in an argument list (curl gets its header from stdin with -K -, printf being a
 # builtin), never in a settings file, never logged and never printed.
@@ -76,12 +81,17 @@
 # Isolation from ~/.claude/settings.json: every mode except --full and --user-scope passes
 # --setting-sources project,local (user scope off), as the reference does. --settings
 # <per-run file> pins model local, the ANTHROPIC_*_MODEL and CLAUDE_CODE_SUBAGENT_MODEL
-# pins, ANTHROPIC_BASE_URL and disableAllHooks false. That these flag-level values win
+# pins, ANTHROPIC_BASE_URL, CLAUDE_CODE_SHELL and SHELL, and disableAllHooks false. That
+# these flag-level values win
 # over the project and local files of the working directory is UNVERIFIED on this client
 # (2.1.322): the launcher therefore refuses to start when <cwd>/.claude/settings.json or
 # settings.local.json holds apiKeyHelper, disableAllHooks, hooks, a permissions.defaultMode
 # other than manual/acceptEdits/plan/default, or an env name starting ANTHROPIC_ or
-# CLAUDE_CODE_ or a proxy variable (or cannot be parsed). Whether claude reads the git
+# CLAUDE_CODE_, SHELL, CLAUDE_ENV_FILE or a proxy variable (or cannot be parsed). Under
+# --user-scope and --full the user settings load too and are never read here: an env
+# entry there (SHELL, CLAUDE_CODE_SHELL_PREFIX, CLAUDE_ENV_FILE, ...) applies; for the
+# two shell names the per-run file's pin is documented to outrank it (UNVERIFIED), for
+# the prefix and the env file nothing here overrides it. Whether claude reads the git
 # top level's .claude instead of the cwd's when started in a subdirectory is UNVERIFIED.
 # The user-scope CLAUDE.md still loads under --setting-sources (reference finding on
 # Windows; UNVERIFIED on macOS). That this claude build honours --setting-sources the same
@@ -114,7 +124,12 @@ say() { printf 'claude-local: %s\n' "$*" >&2; }
 #     which needs none); the dynamic loader: every DYLD_* (SIP already strips these when
 #     /bin/bash starts);
 #   another config dir and the markers of a parent agent session: CLAUDE_CONFIG_DIR,
-#     CLAUDECODE, CLAUDE_EFFORT, CLAUDE_PID, AI_AGENT.
+#     CLAUDECODE, CLAUDE_EFFORT, CLAUDE_PID, AI_AGENT;
+#   what the client runs around or before each shell command: CLAUDE_ENV_FILE (a script
+#     run before every Bash command) and, inside CLAUDE_CODE_*, CLAUDE_CODE_SHELL and
+#     CLAUDE_CODE_SHELL_PREFIX (a wrapper of every Bash and hook command). The session
+#     shell is pinned in the launch block instead (see SESSION_SHELL); an inherited SHELL
+#     is left alone until then and overwritten there.
 # The test-only tool override (LIS_TEST_CLIENT_BIN, see the tools step) is read first
 # into an unexported variable, then scrubbed with the rest.
 TEST_BIN=${LIS_TEST_CLIENT_BIN-}
@@ -127,7 +142,8 @@ for name in $(compgen -e); do
             CURL_CA_BUNDLE | REQUESTS_CA_BUNDLE | \
             BASH_ENV | ENV | PYTHON* | \
             DYLD_* | \
-            CLAUDE_CONFIG_DIR | CLAUDECODE | CLAUDE_EFFORT | CLAUDE_PID | AI_AGENT)
+            CLAUDE_CONFIG_DIR | CLAUDECODE | CLAUDE_EFFORT | CLAUDE_PID | AI_AGENT | \
+            CLAUDE_ENV_FILE)
             unset "$name" ;;
     esac
 done
@@ -141,6 +157,13 @@ VERIFY_DOC="$ROOT/scripts/verify-doc.py"
 SERVE="$ROOT/scripts/serve.sh"
 KEY_FILE="$ROOT/logs/api-key"
 NL=$'\n'
+# The shell of the session's Bash tool. lis-guard models bash syntax; Claude Code takes the
+# tool's shell from CLAUDE_CODE_SHELL, else from $SHELL (zsh on this Mac), and zsh has
+# syntax bash lacks (=( ), =name, glob qualifiers that run code). Fixed path, no PATH
+# lookup, no Homebrew bash: the system /bin/bash (3.2). Given to claude as CLAUDE_CODE_SHELL
+# and SHELL (so a silent fallback to auto-detection, documented for a value that is not a
+# working bash or zsh, still lands on bash) in the process env and in the --settings file.
+SESSION_SHELL=/bin/bash
 
 # ---------------------------------------------------------------- 1. refusals
 FULL=0; START_SERVER=0; NO_GUARD=0; NO_LOOP_GUARD=0; STRICT_SLOT=0; USER_SCOPE=0
@@ -424,6 +447,10 @@ else
 fi
 check_tool python3.13 "$PY_FOUND"; PY=$TOOL
 check_tool curl "$CURL_FOUND"; CURL=$TOOL
+# The session shell gets the same checks (absolute, a regular executable file, the path,
+# its real file and both directories owned by root or me and not writable by everyone).
+# Not taken from the test override: always the fixed path.
+check_tool 'bash (the session shell)' "$SESSION_SHELL"
 CLAUDE=
 if [ "$PRINT_ARGS" = 0 ]; then
     check_tool claude "$CLAUDE_FOUND"; CLAUDE=$TOOL
@@ -432,7 +459,8 @@ fi
 # The working directory's project settings (claude reads <cwd>/.claude/settings.json and
 # settings.local.json in every mode here). Whether the --settings file outranks them key
 # by key is UNVERIFIED on this client, so a project file that could re-route the key,
-# switch hooks off, add hooks or widen the permission mode refuses the launch. Parsed as
+# switch hooks off, add hooks, widen the permission mode or change the session shell (env
+# CLAUDE_CODE_SHELL, SHELL, CLAUDE_CODE_SHELL_PREFIX, CLAUDE_ENV_FILE) refuses the launch. Parsed as
 # JSON; an unreadable or unparseable file refuses too. Names only, never a value.
 IFS= read -r -d '' PROJECT_PY <<'PYEOF'
 import json
@@ -440,6 +468,8 @@ import os
 
 MODES = {'manual', 'acceptEdits', 'plan', 'default'}
 PROXY = {'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy'}
+# The session shell and what the client runs around or before each shell command.
+SHELL_ENV = {'CLAUDE_CODE_SHELL', 'SHELL', 'CLAUDE_CODE_SHELL_PREFIX', 'CLAUDE_ENV_FILE'}
 found = []
 for name in ('settings.json', 'settings.local.json'):
     path = os.path.join(os.getcwd(), '.claude', name)
@@ -468,7 +498,8 @@ for name in ('settings.json', 'settings.local.json'):
     env = d.get('env')
     if isinstance(env, dict):
         for k in env:
-            if k.upper().startswith(('ANTHROPIC_', 'CLAUDE_CODE_')) or k.lower() in PROXY:
+            if (k.upper().startswith(('ANTHROPIC_', 'CLAUDE_CODE_')) or k.lower() in PROXY
+                    or k.upper() in SHELL_ENV):
                 found.append(f'{rel}: key env.{json.dumps(k)[1:-1]}')
     elif 'env' in d:
         found.append(f'{rel}: key env is not an object')
@@ -522,14 +553,14 @@ POLICY+=" Plain reads may run in parallel; per Bash batch run at most one comman
 # The settings builder (reference: the $cfg block of claude-local.ps1). Arguments, in
 # order: source, output ('-' = stdout), context tokens, session start, home, repo, run
 # dir as created, run dir resolved, python, guard on (1/0), loop guards on (1/0), the
-# base URL, the hook copy paths (name=path ...). Nothing secret is passed.
+# base URL, the session shell, the hook copy paths (name=path ...). Nothing secret is passed.
 IFS= read -r -d '' OVERLAY_PY <<'PYEOF'
 import json
 import os
 import sys
 
-(src, out, ctx, start, home, repo, run_given, run_real, py, guard, loop, base) = sys.argv[1:13]
-copies = dict(a.split('=', 1) for a in sys.argv[13:])
+(src, out, ctx, start, home, repo, run_given, run_real, py, guard, loop, base, shell) = sys.argv[1:14]
+copies = dict(a.split('=', 1) for a in sys.argv[14:])
 with open(src, encoding='utf-8') as f:
     cfg = json.load(f)
 
@@ -551,6 +582,10 @@ cfg['disableAllHooks'] = False
 cfg.pop('apiKeyHelper', None)
 cfg['env']['CLAUDE_CODE_AUTO_COMPACT_WINDOW'] = ctx
 cfg['env']['LIS_SESSION_START'] = start
+# The session shell, as in the process env (a settings env value replaces the process one,
+# so this file holds the same value; documented to outrank user-scope settings, UNVERIFIED).
+cfg['env']['CLAUDE_CODE_SHELL'] = shell
+cfg['env']['SHELL'] = shell
 perms = cfg.setdefault('permissions', {})
 hr = rule_root(home)
 for kind in ('allow', 'ask', 'deny'):
@@ -645,6 +680,7 @@ else SCOPE_NOTE='off (S-O3)'; fi
 if [ "$NO_GUARD" = 1 ]; then GUARD_NOTE=off
 elif [ "$NO_LOOP_GUARD" = 1 ]; then GUARD_NOTE='on, loop-guard+repeat-guard off'
 else GUARD_NOTE=on; fi
+SHELL_NOTE="session shell: $SESSION_SHELL (pinned as CLAUDE_CODE_SHELL and SHELL)"
 
 copy_args() {    # $1 = run dir: name=path for each hook copy
     COPY_ARGS=()
@@ -659,6 +695,7 @@ if [ "$PRINT_ARGS" = 1 ]; then
     copy_args "$run"
     say "print only: no server contact, no key read, nothing written, claude not started"
     say "user scope: $SCOPE_NOTE   guard: $GUARD_NOTE   context tokens: $CTX_TOKENS$CTX_NOTE"
+    say "$SHELL_NOTE"
     [ -z "$TURNS_NOTE" ] || say "$TURNS_NOTE"
     printf '%s\n' 'claude arguments (JSON array, in order):'
     "$PY" -I -c 'import json, sys; print(json.dumps(sys.argv[1:], indent=2))' \
@@ -667,7 +704,8 @@ if [ "$PRINT_ARGS" = 1 ]; then
     printf '%s\n' 'settings JSON (the --settings file):'
     "$PY" -I -c "$OVERLAY_PY" "$SETTINGS_SRC" - "$CTX_TOKENS" "$SESSION_START" "$HOME" "$ROOT" \
         "$run" "$run" "$PY" "$([ "$NO_GUARD" = 0 ] && echo 1 || echo 0)" \
-        "$([ "$NO_LOOP_GUARD" = 0 ] && echo 1 || echo 0)" "$BASE_URL" ${COPY_ARGS[@]+"${COPY_ARGS[@]}"} ||
+        "$([ "$NO_LOOP_GUARD" = 0 ] && echo 1 || echo 0)" "$BASE_URL" "$SESSION_SHELL" \
+        ${COPY_ARGS[@]+"${COPY_ARGS[@]}"} ||
         die "could not build the settings."
     printf '%s\n' 'MCP config JSON (the --mcp-config file):' '{"mcpServers":{}}'
     exit 0
@@ -754,7 +792,8 @@ done
 copy_args "$RUN_REAL"
 "$PY" -I -c "$OVERLAY_PY" "$SETTINGS_SRC" "$SETTINGS" "$CTX_TOKENS" "$SESSION_START" "$HOME" \
     "$ROOT" "$RUN_DIR" "$RUN_REAL" "$PY" "$([ "$NO_GUARD" = 0 ] && echo 1 || echo 0)" \
-    "$([ "$NO_LOOP_GUARD" = 0 ] && echo 1 || echo 0)" "$BASE_URL" ${COPY_ARGS[@]+"${COPY_ARGS[@]}"} ||
+    "$([ "$NO_LOOP_GUARD" = 0 ] && echo 1 || echo 0)" "$BASE_URL" "$SESSION_SHELL" \
+    ${COPY_ARGS[@]+"${COPY_ARGS[@]}"} ||
     die "could not build the per-run settings."
 printf '%s\n' '{"mcpServers":{}}' > "$MCP" || die "could not write the MCP config."
 chmod 400 "$SETTINGS" "$MCP" || die "chmod 400 of the per-run settings failed."
@@ -763,6 +802,7 @@ build_lean "$MCP"
 say "hook copies: $RUN_REAL (read-only, kept after exit)"
 say "user scope: $SCOPE_NOTE"
 say "profile: none   guard: $GUARD_NOTE   context tokens: $CTX_TOKENS$CTX_NOTE"
+say "$SHELL_NOTE"
 [ -z "$TURNS_NOTE" ] || say "$TURNS_NOTE"
 
 # ---------------------------------------------------------------- 6. env and launch
@@ -783,6 +823,8 @@ export DISABLE_PROMPT_CACHING=1
 export ENABLE_TOOL_SEARCH=false
 export CLAUDE_CODE_ATTRIBUTION_HEADER=0
 export LIS_SESSION_START="$SESSION_START"
+export CLAUDE_CODE_SHELL="$SESSION_SHELL"
+export SHELL="$SESSION_SHELL"
 KEY=
 
 # A child, not exec, so the EXIT trap removes the settings and MCP files afterwards.

